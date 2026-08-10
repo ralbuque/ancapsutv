@@ -29,3 +29,19 @@ FPS = 30
 VIDEO_BITRATE = "4500k"
 AUDIO_BITRATE = "160k"
 X264_PRESET = "veryfast"
+
+# --- Publicação automática no X (ex-Twitter) ---
+# Credenciais em developer.x.com (app com permissão Read and Write, OAuth 1.0a)
+X_ENABLED = False
+X_API_KEY = ""              # API Key (Consumer Key)
+X_API_SECRET = ""           # API Key Secret
+X_ACCESS_TOKEN = ""         # Access Token
+X_ACCESS_TOKEN_SECRET = ""  # Access Token Secret
+
+# Texto do post. Placeholders: {title} e {url} (link do vídeo no YouTube).
+# ATENÇÃO: no plano pay-per-use do X, post com link custa ~US$0,20;
+# sem link, ~US$0,015. O padrão é só o título.
+X_TEXT_TEMPLATE = "{title}"
+
+X_MAX_VIDEO_SECONDS = 140   # limite de contas comuns; Premium aceita mais
+X_IF_TOO_LONG = "trim"      # "trim" = posta os primeiros 140s / "skip" = não posta

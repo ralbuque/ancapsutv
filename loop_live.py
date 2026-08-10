@@ -68,6 +68,16 @@ VIDEO_BITRATE = _get("VIDEO_BITRATE", "4500k")
 AUDIO_BITRATE = _get("AUDIO_BITRATE", "160k")
 X264_PRESET = _get("X264_PRESET", "veryfast")
 
+# Publicação automática no X (ex-Twitter)
+X_ENABLED = _get("X_ENABLED", False)
+X_API_KEY = _get("X_API_KEY", "")
+X_API_SECRET = _get("X_API_SECRET", "")
+X_ACCESS_TOKEN = _get("X_ACCESS_TOKEN", "")
+X_ACCESS_TOKEN_SECRET = _get("X_ACCESS_TOKEN_SECRET", "")
+X_TEXT_TEMPLATE = _get("X_TEXT_TEMPLATE", "{title}")
+X_MAX_VIDEO_SECONDS = _get("X_MAX_VIDEO_SECONDS", 140)
+X_IF_TOO_LONG = _get("X_IF_TOO_LONG", "trim")  # "trim" corta / "skip" não posta
+
 # ======================================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -206,6 +216,61 @@ def prepare_bumper() -> None:
         restart_event.set()
 
 
+# ------------------------- POST NO X ----------------------------------
+
+def post_to_x(video_id: str, title: str) -> None:
+    """Posta o vídeo processado no X. Falhas não interrompem o pipeline."""
+    if not X_ENABLED:
+        return
+    try:
+        import tweepy
+    except ImportError:
+        log("AVISO: tweepy não instalado (python -m pip install tweepy) — "
+            "post no X pulado.")
+        return
+
+    src = VIDEO_DIR / f"{video_id}.ts"
+    mp4 = TMP_DIR / f"{video_id}_x.mp4"
+    TMP_DIR.mkdir(exist_ok=True)
+
+    dur = video_duration(src) or 0
+    cmd = ["ffmpeg", "-y", "-i", str(src)]
+    if dur > X_MAX_VIDEO_SECONDS:
+        if X_IF_TOO_LONG == "skip":
+            log(f"X: {video_id} tem {dur:.0f}s (limite {X_MAX_VIDEO_SECONDS}s) "
+                "— post pulado.")
+            return
+        log(f"X: {video_id} tem {dur:.0f}s — cortando para "
+            f"{X_MAX_VIDEO_SECONDS}s no post.")
+        cmd += ["-t", str(X_MAX_VIDEO_SECONDS)]
+    cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc",
+            "-movflags", "+faststart", str(mp4)]
+    r = run(cmd)
+    if r.returncode != 0 or not mp4.exists():
+        log(f"ERRO ao preparar mp4 para o X: {r.stderr.strip()[:300]}")
+        return
+
+    try:
+        auth = tweepy.OAuth1UserHandler(X_API_KEY, X_API_SECRET,
+                                        X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
+        api = tweepy.API(auth)
+        log(f"X: enviando vídeo {video_id}...")
+        media = api.media_upload(str(mp4), chunked=True,
+                                 media_category="tweet_video")
+        client = tweepy.Client(
+            consumer_key=X_API_KEY, consumer_secret=X_API_SECRET,
+            access_token=X_ACCESS_TOKEN,
+            access_token_secret=X_ACCESS_TOKEN_SECRET)
+        text = X_TEXT_TEMPLATE.format(
+            title=title, url=f"https://youtu.be/{video_id}")[:280]
+        client.create_tweet(text=text, media_ids=[media.media_id])
+        log(f"X: postado {video_id}.")
+    except Exception as e:
+        log(f"ERRO ao postar no X ({video_id}): {e}")
+    finally:
+        mp4.unlink(missing_ok=True)
+
+
 # ---------------------------- MONITOR ---------------------------------
 
 def latest_video_ids() -> list:
@@ -220,11 +285,12 @@ def latest_video_ids() -> list:
     return [l.strip() for l in r.stdout.splitlines() if l.strip()]
 
 
-def download_and_normalize(video_id: str) -> bool:
-    """Baixa, corta o final, legenda e converte para .ts padronizado."""
+def download_and_normalize(video_id: str):
+    """Baixa, corta o final, legenda e converte para .ts padronizado.
+    Retorna (ok, título)."""
     out_file = VIDEO_DIR / f"{video_id}.ts"
     if out_file.exists():
-        return True
+        return True, None
 
     TMP_DIR.mkdir(exist_ok=True)
     raw = TMP_DIR / f"{video_id}.mp4"
@@ -234,12 +300,14 @@ def download_and_normalize(video_id: str) -> bool:
     r = run(ytdlp_cmd() + [
         "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
         "--merge-output-format", "mp4",
+        "--no-simulate", "--print", "%(title)s",
         "-o", str(raw),
         f"https://www.youtube.com/watch?v={video_id}",
     ])
     if r.returncode != 0 or not raw.exists():
         log(f"ERRO no download de {video_id}: {r.stderr.strip()[:400]}")
-        return False
+        return False, None
+    title = (r.stdout.strip().splitlines() or [""])[0]
 
     # corte dos segundos finais
     t_limit = None
@@ -267,7 +335,7 @@ def download_and_normalize(video_id: str) -> bool:
     srt.unlink(missing_ok=True)
     if ok:
         log(f"Pronto: {out_file.name}")
-    return ok
+    return ok, title
 
 
 def write_playlist(ids_newest_first: list) -> None:
@@ -304,11 +372,13 @@ def watcher() -> None:
                 for k, vid in enumerate(new):
                     if k > 0:
                         time.sleep(DOWNLOAD_PAUSE)  # não martelar o YouTube
-                    if download_and_normalize(vid):
+                    ok, title = download_and_normalize(vid)
+                    if ok:
                         # entra no ar imediatamente, sem esperar o lote todo
                         write_playlist(ids)
                         restart_event.set()
                         log(f"{vid} entrou no loop.")
+                        post_to_x(vid, title or "")
                 prune_old(ids)
                 if not PLAYLIST.exists():
                     write_playlist(ids)
@@ -369,6 +439,19 @@ def check_tools() -> None:
                 "Instale no MESMO Python que executa este script:\n"
                 "  python -m pip install faster-whisper\n"
                 "(ou desative as legendas com BURN_SUBTITLES = False no config.py)")
+    if X_ENABLED:
+        try:
+            import tweepy  # noqa: F401
+        except ImportError as e:
+            sys.exit(f"ERRO ao importar o tweepy: {e}\n"
+                     f"Python em uso: {sys.executable}\n"
+                     "Instale com:  python -m pip install tweepy\n"
+                     "(ou desative o X com X_ENABLED = False no config.py)")
+        if not all([X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN,
+                    X_ACCESS_TOKEN_SECRET]):
+            sys.exit("ERRO: X_ENABLED = True, mas faltam credenciais "
+                     "X_API_KEY / X_API_SECRET / X_ACCESS_TOKEN / "
+                     "X_ACCESS_TOKEN_SECRET no config.py.")
 
 
 def main() -> None:

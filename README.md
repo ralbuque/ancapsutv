@@ -81,6 +81,22 @@ Para o script sobreviver a reinicializações do servidor, use o **Agendador de 
 4. Ações: programa `python`, argumentos `C:\caminho\loop_live.py`, iniciar em `C:\caminho\`.
 5. Configurações: marque "Se a tarefa falhar, reiniciar a cada 1 minuto".
 
+## Publicação automática no X (opcional)
+
+Com `X_ENABLED = True` no `config.py`, cada vídeo novo processado (já cortado e legendado) é postado no X com o título do vídeo. Requer `python -m pip install tweepy`.
+
+Para obter as credenciais:
+
+1. Acesse [developer.x.com](https://developer.x.com) logado com a conta do X que vai postar e crie uma conta de desenvolvedor. Novas contas usam o plano **pay-per-use**: é preciso cadastrar pagamento e comprar créditos (~US$ 0,015 por post com vídeo; 8–10 posts/dia ≈ US$ 4–5/mês).
+2. Crie um **Project** e dentro dele um **App**.
+3. No App: **User authentication settings** → habilite **OAuth 1.0a** com permissão **Read and Write** (as URLs de callback/website podem ser a do seu canal — não são usadas).
+4. Em **Keys and tokens**, copie: **API Key**, **API Key Secret**, e gere o **Access Token e Secret** (confira que aparecem como "Read and Write" — se gerou antes de mudar a permissão, regenere).
+5. Cole os quatro valores no `config.py`.
+
+Detalhes: contas comuns só aceitam vídeos de até 2min20s — o script corta o post nesse limite por padrão (`X_IF_TOO_LONG = "trim"`; use `"skip"` para não postar os longos, ou aumente `X_MAX_VIDEO_SECONDS` se a conta tiver Premium). Evite `{url}` no `X_TEXT_TEMPLATE`: post com link custa ~US$ 0,20 em vez de US$ 0,015.
+
+**Importante:** ative o X só depois da carga inicial dos 20 vídeos terminar, senão o script posta o lote antigo inteiro de uma vez.
+
 ## Observações importantes
 
 - **Espaço em disco**: 20 vídeos a ~4,5 Mbps ocupam na faixa de 0,5–2 GB no total (depende da duração). O script apaga automaticamente os que saem do loop.
