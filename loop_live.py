@@ -99,6 +99,15 @@ INTRO_BANNER = _get("INTRO_BANNER", True)
 INTRO_SECONDS = _get("INTRO_SECONDS", 30)
 INTRO_FONT = _get("INTRO_FONT", "C:/Windows/Fonts/arialbd.ttf")
 
+# Lower third (sobreposto na transmissão — exige re-codificação contínua!)
+LOWER_THIRD = _get("LOWER_THIRD", False)
+LOWER_THIRD_NAME = _get("LOWER_THIRD_NAME", "Peter Turguniev")
+LOWER_THIRD_CHANNEL = _get("LOWER_THIRD_CHANNEL", "ANCAPSU")
+LOWER_THIRD_PRESET = _get("LOWER_THIRD_PRESET", "veryfast")
+TICKER_COUNT = _get("TICKER_COUNT", 3)      # quantos títulos ciclam na barra
+TICKER_SECONDS = _get("TICKER_SECONDS", 8)  # segundos que cada título fica
+ALERT_MINUTES = _get("ALERT_MINUTES", 10)   # duração do aviso "NOVO VÍDEO"
+
 # ======================================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -127,6 +136,9 @@ def _encode_args() -> list:
 COOKIES_FILE = BASE_DIR / "cookies.txt"
 VOCAB_FILE = BASE_DIR / "vocabulario.txt"    # nomes próprios e siglas, 1 por linha
 FIXES_FILE = BASE_DIR / "correcoes.txt"      # linhas "errado => certo"
+TICKER_FILE = BASE_DIR / "ticker.txt"        # texto da barra (lido pelo ffmpeg)
+ALERT_FILE = BASE_DIR / "alert.txt"          # texto do alerta "NOVO VÍDEO"
+TITLES_FILE = BASE_DIR / "titles.json"       # títulos recentes p/ o ticker
 DOWNLOAD_PAUSE = _get("DOWNLOAD_PAUSE", 20)  # segundos entre downloads seguidos
 RTMP_URL = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
 
@@ -299,7 +311,7 @@ def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None,
     cmd += _encode_args() + [tmp_out.name]
     r = run(cmd, cwd=str(workdir))
     if r.returncode != 0 or not tmp_out.exists():
-        log(f"ERRO na normalização de {src.name}: {r.stderr.strip()[:400]}")
+        log(f"ERRO na normalização de {src.name}: {r.stderr.strip()[-400:]}")
         tmp_out.unlink(missing_ok=True)
         return False
     shutil.move(str(tmp_out), str(dst))
@@ -322,7 +334,7 @@ def normalize_short(src: Path, dst: Path) -> bool:
     r = run(cmd, cwd=str(workdir))
     if r.returncode != 0 or not tmp_out.exists():
         log(f"ERRO na normalização do short {src.name}: "
-            f"{r.stderr.strip()[:300]}")
+            f"{r.stderr.strip()[-300:]}")
         tmp_out.unlink(missing_ok=True)
         return False
     shutil.move(str(tmp_out), str(dst))
@@ -398,7 +410,7 @@ def make_endcard(video_id: str, out_ts: Path) -> bool:
     r = run(cmd)
     if r.returncode != 0 or not out_ts.exists():
         log(f"AVISO: falha ao gerar a tela final "
-            f"({r.stderr.strip()[:200]}) — cortando sem aviso.")
+            f"({r.stderr.strip()[-200:]}) — cortando sem aviso.")
         return False
     return True
 
@@ -425,7 +437,7 @@ def build_x_mp4(video_id: str, limit: float):
                  "-c", "copy", str(main)])
         if r.returncode != 0 or not main.exists():
             log(f"ERRO ao cortar {video_id} para o X: "
-                f"{r.stderr.strip()[:200]}")
+                f"{r.stderr.strip()[-200:]}")
             for f in aux:
                 f.unlink(missing_ok=True)
             return None
@@ -458,7 +470,7 @@ def build_x_mp4(video_id: str, limit: float):
     for f in aux:
         safe_unlink(f)
     if r.returncode != 0 or not mp4.exists():
-        log(f"ERRO ao preparar mp4 para o X: {r.stderr.strip()[:300]}")
+        log(f"ERRO ao preparar mp4 para o X: {r.stderr.strip()[-300:]}")
         return None
     return mp4, eff_dur
 
@@ -562,7 +574,7 @@ def latest_video_ids() -> list:
         "--print", "%(id)s", CHANNEL_URL,
     ])
     if r.returncode != 0:
-        log(f"ERRO ao consultar o canal: {r.stderr.strip()[:400]}")
+        log(f"ERRO ao consultar o canal: {r.stderr.strip()[-400:]}")
         return []
     return [l.strip() for l in r.stdout.splitlines() if l.strip()]
 
@@ -588,7 +600,7 @@ def download_and_normalize(video_id: str):
         f"https://www.youtube.com/watch?v={video_id}",
     ])
     if r.returncode != 0 or not raw.exists():
-        log(f"ERRO no download de {video_id}: {r.stderr.strip()[:400]}")
+        log(f"ERRO no download de {video_id}: {r.stderr.strip()[-400:]}")
         return False, None
 
     # título lido do .info.json (sempre UTF-8 — o stdout do yt-dlp.exe sai na
@@ -655,7 +667,7 @@ def sync_shorts() -> None:
         "--print", "%(id)s", PROMO_CHANNEL_URL,
     ])
     if r.returncode != 0:
-        log(f"ERRO ao consultar o canal do promo: {r.stderr.strip()[:200]}")
+        log(f"ERRO ao consultar o canal do promo: {r.stderr.strip()[-200:]}")
         return
     ids = [l.strip() for l in r.stdout.splitlines() if l.strip()]
     for sid in [i for i in ids if not (SHORTS_DIR / f"{i}.ts").exists()]:
@@ -670,7 +682,7 @@ def sync_shorts() -> None:
             f"https://www.youtube.com/watch?v={sid}",
         ])
         if r2.returncode != 0 or not raw.exists():
-            log(f"ERRO no download do short {sid}: {r2.stderr.strip()[:200]}")
+            log(f"ERRO no download do short {sid}: {r2.stderr.strip()[-200:]}")
             continue
         if normalize_short(raw, SHORTS_DIR / f"{sid}.ts"):
             log(f"Short {sid} pronto.")
@@ -748,15 +760,131 @@ def watcher() -> None:
                     ok, title = download_and_normalize(vid)
                     if ok:
                         # entra no ar imediatamente, sem esperar o lote todo
+                        save_title(vid, title or "")
                         sync_playlist(ids)
                         log(f"{vid} entrou no loop.")
+                        set_alert(title or "")
                         post_to_x(vid, title or "")
                 prune_old(ids)
+                update_titles_order(ids)
                 sync_shorts()
                 sync_playlist(ids)  # cobre remoções e recupera atualizações perdidas
         except Exception as e:
             log(f"ERRO inesperado no monitor: {e}")
         time.sleep(CHECK_INTERVAL)
+
+
+# --------------------------- LOWER THIRD ------------------------------
+
+_alert_lock = threading.Lock()
+_alert = {"text": "", "until": 0.0}
+
+
+def set_alert(title: str) -> None:
+    """Ativa o aviso 'NOVO VÍDEO' na barra por ALERT_MINUTES."""
+    if not title:
+        return
+    with _alert_lock:
+        _alert["text"] = title
+        _alert["until"] = time.time() + ALERT_MINUTES * 60
+
+
+def _load_titles() -> dict:
+    try:
+        return json.loads(TITLES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"order": [], "titles": {}}
+
+
+def _save_titles(data: dict) -> None:
+    tmp = TITLES_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(TITLES_FILE)
+
+
+def save_title(video_id: str, title: str) -> None:
+    if not title:
+        return
+    data = _load_titles()
+    data["titles"][video_id] = title
+    _save_titles(data)
+
+
+def update_titles_order(ids_newest_first: list) -> None:
+    data = _load_titles()
+    data["order"] = ids_newest_first
+    data["titles"] = {i: t for i, t in data["titles"].items()
+                      if i in ids_newest_first}
+    _save_titles(data)
+
+
+def _write_text_file(path: Path, text: str) -> None:
+    """Escrita atômica com tolerância ao ffmpeg relendo o arquivo (Windows)."""
+    tmp = path.with_suffix(path.suffix + ".w")
+    tmp.write_text(text, encoding="utf-8")
+    for _ in range(5):
+        try:
+            tmp.replace(path)
+            return
+        except OSError:
+            time.sleep(0.05)
+    try:  # último recurso: escrita direta
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def ticker_thread() -> None:
+    """Alimenta ticker.txt/alert.txt, relidos a cada frame pelo drawtext."""
+    last_t, last_a = None, None
+    while True:
+        try:
+            now = time.time()
+            with _alert_lock:
+                a_text, a_until = _alert["text"], _alert["until"]
+            if a_text and now < a_until:
+                t_text, al = "", f"NOVO VÍDEO  •  {a_text}"
+            else:
+                data = _load_titles()
+                titles = [data["titles"][i] for i in data.get("order", [])
+                          if i in data.get("titles", {})][:TICKER_COUNT]
+                if titles:
+                    idx = int(now // TICKER_SECONDS) % len(titles)
+                    t_text = f"ÚLTIMOS VÍDEOS  •  {titles[idx]}"
+                else:
+                    t_text = ""
+                al = ""
+            if t_text != last_t:
+                _write_text_file(TICKER_FILE, t_text)
+                last_t = t_text
+            if al != last_a:
+                _write_text_file(ALERT_FILE, al)
+                last_a = al
+        except Exception as e:
+            log(f"ERRO no ticker: {e}")
+        time.sleep(1)
+
+
+def lower_third_filter() -> str:
+    """Filtro drawtext do lower third. Os arquivos de texto são relidos a cada
+    frame (reload=1); com texto vazio, a barra é movida para fora da tela."""
+    font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
+            if Path(INTRO_FONT).exists() else "")
+    name = LOWER_THIRD_NAME.replace("'", "").replace(":", "\\:")
+    chan = LOWER_THIRD_CHANNEL.replace("'", "").replace(":", "\\:")
+    offx = "x=if(gt(text_w\\,2)\\,330\\,w+50)"
+    return (
+        f"drawtext={font}text='{name}':fontsize=30:fontcolor=white:"
+        f"x=24:y=h-121:box=1:boxcolor=0x101010@0.85:boxborderw=12,"
+        f"drawtext={font}text='{chan}':fontsize=26:fontcolor=0xFFD75E:"
+        f"x=24:y=h-68:box=1:boxcolor=0x101010@0.85:boxborderw=12,"
+        f"drawtext={font}textfile=ticker.txt:reload=1:expansion=none:"
+        f"fontsize=28:fontcolor=white:{offx}:y=h-68:"
+        f"box=1:boxcolor=0x0B57D0@0.85:boxborderw=14,"
+        f"drawtext={font}textfile=alert.txt:reload=1:expansion=none:"
+        f"fontsize=28:fontcolor=white:{offx}:y=h-68:"
+        f"box=1:boxcolor=0xCC1111@0.92:boxborderw=14"
+    )
 
 
 # ---------------------------- STREAMER --------------------------------
@@ -789,11 +917,20 @@ def streamer() -> None:
             "ffmpeg", "-hide_banner", "-loglevel", "warning",
             "-re", "-stream_loop", "-1",
             "-f", "concat", "-safe", "0", "-i", str(PLAYLIST),
-            "-c", "copy", "-bsf:a", "aac_adtstoasc",
-            "-f", "flv", RTMP_URL,
         ]
-        log("Iniciando transmissão...")
-        proc = subprocess.Popen(cmd)
+        if LOWER_THIRD:
+            cmd += ["-vf", lower_third_filter(),
+                    "-c:v", "libx264", "-preset", LOWER_THIRD_PRESET,
+                    "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE,
+                    "-bufsize", "9000k", "-g", str(FPS * 2),
+                    "-c:a", "copy"]
+            log("Iniciando transmissão (lower third ATIVO — re-codificando; "
+                "acompanhe o uso de CPU).")
+        else:
+            cmd += ["-c", "copy"]
+            log("Iniciando transmissão...")
+        cmd += ["-bsf:a", "aac_adtstoasc", "-f", "flv", RTMP_URL]
+        proc = subprocess.Popen(cmd, cwd=str(BASE_DIR))
 
         # espera o processo cair ou a playlist mudar
         while proc.poll() is None and not restart_event.is_set():
@@ -848,6 +985,13 @@ def main() -> None:
     log(f"Loop com os últimos {MAX_VIDEOS} vídeos | verificação a cada {CHECK_INTERVAL}s")
     log(f"Corte final: {CUT_END_SECONDS}s | Legendas: "
         f"{'ativadas (' + WHISPER_MODEL + ')' if BURN_SUBTITLES else 'desativadas'}")
+    if LOWER_THIRD:
+        # os arquivos precisam existir antes do primeiro ffmpeg com drawtext
+        for f in (TICKER_FILE, ALERT_FILE):
+            if not f.exists():
+                f.write_text("", encoding="utf-8")
+        threading.Thread(target=ticker_thread, daemon=True,
+                         name="ticker").start()
     threading.Thread(target=watcher, daemon=True, name="watcher").start()
     try:
         streamer()

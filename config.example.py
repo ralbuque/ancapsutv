@@ -35,6 +35,17 @@ INTRO_BANNER = True
 INTRO_SECONDS = 30
 INTRO_FONT = "C:/Windows/Fonts/arialbd.ttf"  # fonte do título
 
+# --- Lower third (nome + canal + barra de títulos na base da tela) ---
+# ATENÇÃO: liga a re-codificação contínua da transmissão (usa bastante CPU).
+# Se pesar no servidor, volte para False e reinicie — o modo leve retorna.
+LOWER_THIRD = False
+LOWER_THIRD_NAME = "Peter Turguniev"
+LOWER_THIRD_CHANNEL = "ANCAPSU"
+LOWER_THIRD_PRESET = "veryfast"  # se a CPU sofrer, tente "superfast"
+TICKER_COUNT = 3      # quantos títulos recentes ciclam na barra
+TICKER_SECONDS = 8    # segundos que cada título fica na tela
+ALERT_MINUTES = 10    # duração do aviso vermelho "NOVO VÍDEO: ..."
+
 # --- Bloco promocional do outro canal (alterna com a vinheta) ---
 # Sequência: chamada.mp4 -> um short do outro canal -> continuidade.mp4
 PROMO_ENABLED = False

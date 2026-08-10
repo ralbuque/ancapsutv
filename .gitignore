@@ -5,6 +5,9 @@ playlist.txt
 playlist_new.txt
 *.tmp
 *.srt
+ticker.txt
+alert.txt
+titles.json
 bumper.ts
 vinheta.mp4
 chamada.mp4
