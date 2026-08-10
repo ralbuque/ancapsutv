@@ -2,6 +2,8 @@ config.py
 videos/
 tmp/
 playlist.txt
+playlist_new.txt
+*.tmp
 bumper.ts
 vinheta.mp4
 __pycache__/

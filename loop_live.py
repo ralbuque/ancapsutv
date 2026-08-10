@@ -86,6 +86,7 @@ BASE_DIR = Path(__file__).resolve().parent
 VIDEO_DIR = BASE_DIR / "videos"
 TMP_DIR = BASE_DIR / "tmp"
 PLAYLIST = BASE_DIR / "playlist.txt"
+PLAYLIST_PENDING = BASE_DIR / "playlist_new.txt"
 BUMPER_SOURCE = BASE_DIR / BUMPER_SOURCE_NAME
 BUMPER_TS = BASE_DIR / "bumper.ts"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
@@ -103,7 +104,6 @@ def ytdlp_cmd() -> list:
     return cmd
 
 restart_event = threading.Event()   # avisa o streamer que a playlist mudou
-playlist_lock = threading.Lock()
 _whisper_model = None
 
 
@@ -359,8 +359,8 @@ def download_and_normalize(video_id: str):
     return ok, title
 
 
-def write_playlist(ids_newest_first: list) -> None:
-    """Grava playlist.txt em ordem cronológica, com a vinheta entre os vídeos."""
+def build_playlist_text(ids_newest_first: list) -> str:
+    """Playlist em ordem cronológica, com a vinheta entre os vídeos."""
     available = [i for i in ids_newest_first if (VIDEO_DIR / f"{i}.ts").exists()]
     bumper = f"file '{BUMPER_TS.as_posix()}'" if BUMPER_TS.exists() else None
     lines = []
@@ -368,10 +368,27 @@ def write_playlist(ids_newest_first: list) -> None:
         lines.append(f"file '{(VIDEO_DIR / f'{i}.ts').as_posix()}'")
         if bumper:
             lines.append(bumper)  # também toca entre o último e o primeiro do loop
-    tmp = PLAYLIST.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    with playlist_lock:
-        tmp.replace(PLAYLIST)
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+def sync_playlist(ids_newest_first: list) -> None:
+    """Se a playlist desejada mudou, grava em playlist_new.txt e pede reinício.
+    O streamer troca o arquivo só com o FFmpeg parado — no Windows não dá para
+    substituir o playlist.txt enquanto o FFmpeg o mantém aberto."""
+    desired = build_playlist_text(ids_newest_first)
+    if not desired:
+        return
+    if PLAYLIST_PENDING.exists():
+        current = PLAYLIST_PENDING.read_text(encoding="utf-8")
+    elif PLAYLIST.exists():
+        current = PLAYLIST.read_text(encoding="utf-8")
+    else:
+        current = ""
+    if desired != current:
+        tmp = PLAYLIST_PENDING.with_suffix(".tmp")
+        tmp.write_text(desired, encoding="utf-8")
+        tmp.replace(PLAYLIST_PENDING)
+        restart_event.set()
 
 
 def prune_old(keep_ids: list) -> None:
@@ -396,13 +413,11 @@ def watcher() -> None:
                     ok, title = download_and_normalize(vid)
                     if ok:
                         # entra no ar imediatamente, sem esperar o lote todo
-                        write_playlist(ids)
-                        restart_event.set()
+                        sync_playlist(ids)
                         log(f"{vid} entrou no loop.")
                         post_to_x(vid, title or "")
                 prune_old(ids)
-                if not PLAYLIST.exists():
-                    write_playlist(ids)
+                sync_playlist(ids)  # cobre remoções e recupera atualizações perdidas
         except Exception as e:
             log(f"ERRO inesperado no monitor: {e}")
         time.sleep(CHECK_INTERVAL)
@@ -410,8 +425,24 @@ def watcher() -> None:
 
 # ---------------------------- STREAMER --------------------------------
 
+def apply_pending_playlist() -> None:
+    """Troca playlist_new.txt -> playlist.txt (chamar só com o FFmpeg parado)."""
+    if not PLAYLIST_PENDING.exists():
+        return
+    for _ in range(10):
+        try:
+            PLAYLIST_PENDING.replace(PLAYLIST)
+            log("Playlist atualizada.")
+            return
+        except PermissionError:
+            time.sleep(1)  # Windows pode segurar o arquivo por um instante
+    log("AVISO: não consegui atualizar playlist.txt (arquivo em uso); "
+        "tento de novo no próximo reinício.")
+
+
 def streamer() -> None:
     while True:
+        apply_pending_playlist()
         if not PLAYLIST.exists() or not PLAYLIST.read_text(encoding="utf-8").strip():
             log("Aguardando vídeos na playlist...")
             time.sleep(10)
