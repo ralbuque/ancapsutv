@@ -131,6 +131,14 @@ def run(cmd: list, **kw) -> subprocess.CompletedProcess:
                           encoding="utf-8", errors="replace", env=env, **kw)
 
 
+def safe_unlink(p: Path) -> None:
+    """Apaga sem estourar erro se o Windows ainda segura o arquivo aberto."""
+    try:
+        p.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def video_duration(path: Path):
     r = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", str(path)])
@@ -387,7 +395,7 @@ def build_x_mp4(video_id: str, limit: float):
     cmd += ["-movflags", "+faststart", str(mp4)]
     r = run(cmd)
     for f in aux:
-        f.unlink(missing_ok=True)
+        safe_unlink(f)
     if r.returncode != 0 or not mp4.exists():
         log(f"ERRO ao preparar mp4 para o X: {r.stderr.strip()[:300]}")
         return None
@@ -442,10 +450,26 @@ def post_to_x(video_id: str, title: str) -> None:
                 except Exception as e:
                     log(f"AVISO: post ok, mas o reply com o link falhou: {e}")
 
+        def send_with_retry(path, category, attempts=3):
+            """Refaz o envio em caso de falha de rede (upload longo cai às vezes)."""
+            for i in range(attempts):
+                try:
+                    return send(path, category)
+                except Exception as e:
+                    transient = any(s in str(e) for s in (
+                        "Failed to send request", "Connection", "SSL",
+                        "timed out", "Timeout", "Temporarily"))
+                    if transient and i < attempts - 1:
+                        log(f"X: falha de rede no envio "
+                            f"({str(e)[:120]}) — nova tentativa em 60s...")
+                        time.sleep(60)
+                    else:
+                        raise
+
         # vídeos >2min via API exigem a categoria amplify_video (mesmo Premium)
         category = "amplify_video" if eff_dur > 140 else "tweet_video"
         try:
-            send(mp4, category)
+            send_with_retry(mp4, category)
             log(f"X: postado {video_id}.")
         except Exception as e:
             m = re.search(r"longer than (\d+) minutes?", str(e))
@@ -457,14 +481,15 @@ def post_to_x(video_id: str, title: str) -> None:
                 if not built:
                     raise
                 mp4, eff2 = built
-                send(mp4, "amplify_video" if eff2 > 140 else "tweet_video")
+                send_with_retry(mp4,
+                                "amplify_video" if eff2 > 140 else "tweet_video")
                 log(f"X: postado {video_id} (cortado em {new_limit}s).")
             else:
                 raise
     except Exception as e:
         log(f"ERRO ao postar no X ({video_id}): {e}")
     finally:
-        mp4.unlink(missing_ok=True)
+        safe_unlink(mp4)
 
 
 # ---------------------------- MONITOR ---------------------------------
