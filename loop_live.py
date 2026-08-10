@@ -21,6 +21,7 @@ Requisitos no Windows: Python 3.9+, ffmpeg.exe e yt-dlp.exe no PATH,
 e "pip install faster-whisper" para as legendas. Veja o README.md.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -77,6 +78,7 @@ X_ACCESS_TOKEN_SECRET = _get("X_ACCESS_TOKEN_SECRET", "")
 X_TEXT_TEMPLATE = _get("X_TEXT_TEMPLATE", "{title}")
 X_MAX_VIDEO_SECONDS = _get("X_MAX_VIDEO_SECONDS", 140)
 X_IF_TOO_LONG = _get("X_IF_TOO_LONG", "trim")  # "trim" corta / "skip" não posta
+X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 
 # ======================================================================
 
@@ -110,8 +112,11 @@ def log(msg: str) -> None:
 
 
 def run(cmd: list, **kw) -> subprocess.CompletedProcess:
+    # PYTHONUTF8 força o yt-dlp a emitir UTF-8 no Windows (senão títulos com
+    # acentos saem na codificação regional e viram caracteres inválidos)
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     return subprocess.run(cmd, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", **kw)
+                          encoding="utf-8", errors="replace", env=env, **kw)
 
 
 def video_duration(path: Path):
@@ -235,6 +240,7 @@ def post_to_x(video_id: str, title: str) -> None:
 
     dur = video_duration(src) or 0
     cmd = ["ffmpeg", "-y", "-i", str(src)]
+    eff_dur = dur
     if dur > X_MAX_VIDEO_SECONDS:
         if X_IF_TOO_LONG == "skip":
             log(f"X: {video_id} tem {dur:.0f}s (limite {X_MAX_VIDEO_SECONDS}s) "
@@ -243,8 +249,23 @@ def post_to_x(video_id: str, title: str) -> None:
         log(f"X: {video_id} tem {dur:.0f}s — cortando para "
             f"{X_MAX_VIDEO_SECONDS}s no post.")
         cmd += ["-t", str(X_MAX_VIDEO_SECONDS)]
-    cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc",
-            "-movflags", "+faststart", str(mp4)]
+        eff_dur = X_MAX_VIDEO_SECONDS
+
+    # cabe no teto de tamanho da API? senão, recomprime em 720p para caber
+    budget = X_TARGET_SIZE_MB * 1024 * 1024
+    est_size = src.stat().st_size * (eff_dur / dur if dur else 1)
+    if est_size <= budget:
+        cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
+    else:
+        v_kbps = max(400, int(budget * 8 / 1000 / eff_dur) - 128)
+        log(f"X: {video_id} é grande demais ({est_size/1e6:.0f} MB) — "
+            f"recomprimindo em 720p @ {v_kbps}k para caber em "
+            f"{X_TARGET_SIZE_MB} MB (leva alguns minutos).")
+        cmd += ["-vf", "scale=1280:720", "-c:v", "libx264",
+                "-preset", X264_PRESET, "-b:v", f"{v_kbps}k",
+                "-maxrate", f"{v_kbps}k", "-bufsize", f"{v_kbps * 2}k",
+                "-c:a", "aac", "-b:a", "128k"]
+    cmd += ["-movflags", "+faststart", str(mp4)]
     r = run(cmd)
     if r.returncode != 0 or not mp4.exists():
         log(f"ERRO ao preparar mp4 para o X: {r.stderr.strip()[:300]}")

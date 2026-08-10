@@ -43,5 +43,6 @@ X_ACCESS_TOKEN_SECRET = ""  # Access Token Secret
 # sem link, ~US$0,015. O padrão é só o título.
 X_TEXT_TEMPLATE = "{title}"
 
-X_MAX_VIDEO_SECONDS = 140   # limite de contas comuns; Premium aceita mais
-X_IF_TOO_LONG = "trim"      # "trim" = posta os primeiros 140s / "skip" = não posta
+X_MAX_VIDEO_SECONDS = 140   # limite de contas comuns; Premium: use p.ex. 3600
+X_IF_TOO_LONG = "trim"      # "trim" = posta cortado / "skip" = não posta
+X_TARGET_SIZE_MB = 500      # acima disso, a cópia do X é recomprimida em 720p
