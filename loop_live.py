@@ -271,25 +271,47 @@ def post_to_x(video_id: str, title: str) -> None:
         log(f"ERRO ao preparar mp4 para o X: {r.stderr.strip()[:300]}")
         return
 
+    short = TMP_DIR / f"{video_id}_x140.mp4"
     try:
         auth = tweepy.OAuth1UserHandler(X_API_KEY, X_API_SECRET,
                                         X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
         api = tweepy.API(auth)
-        log(f"X: enviando vídeo {video_id}...")
-        media = api.media_upload(str(mp4), chunked=True,
-                                 media_category="tweet_video")
         client = tweepy.Client(
             consumer_key=X_API_KEY, consumer_secret=X_API_SECRET,
             access_token=X_ACCESS_TOKEN,
             access_token_secret=X_ACCESS_TOKEN_SECRET)
         text = X_TEXT_TEMPLATE.format(
             title=title, url=f"https://youtu.be/{video_id}")[:280]
-        client.create_tweet(text=text, media_ids=[media.media_id])
-        log(f"X: postado {video_id}.")
+
+        def send(path, category):
+            log(f"X: enviando vídeo {video_id} ({category})...")
+            media = api.media_upload(str(path), chunked=True,
+                                     media_category=category)
+            client.create_tweet(text=text, media_ids=[media.media_id])
+
+        # vídeos >2min via API exigem a categoria amplify_video (mesmo Premium)
+        category = "amplify_video" if eff_dur > 140 else "tweet_video"
+        try:
+            send(mp4, category)
+            log(f"X: postado {video_id}.")
+        except Exception as e:
+            if category == "amplify_video" and (
+                    "2 minutes" in str(e) or "duration" in str(e).lower()):
+                log(f"X: vídeo longo recusado ({e}) — "
+                    "postando os primeiros 140s como fallback.")
+                r = run(["ffmpeg", "-y", "-i", str(mp4), "-t", "140",
+                         "-c", "copy", "-movflags", "+faststart", str(short)])
+                if r.returncode != 0:
+                    raise
+                send(short, "tweet_video")
+                log(f"X: postado {video_id} (cortado em 140s).")
+            else:
+                raise
     except Exception as e:
         log(f"ERRO ao postar no X ({video_id}): {e}")
     finally:
         mp4.unlink(missing_ok=True)
+        short.unlink(missing_ok=True)
 
 
 # ---------------------------- MONITOR ---------------------------------
