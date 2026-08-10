@@ -76,7 +76,19 @@ TMP_DIR = BASE_DIR / "tmp"
 PLAYLIST = BASE_DIR / "playlist.txt"
 BUMPER_SOURCE = BASE_DIR / BUMPER_SOURCE_NAME
 BUMPER_TS = BASE_DIR / "bumper.ts"
+COOKIES_FILE = BASE_DIR / "cookies.txt"
+DOWNLOAD_PAUSE = _get("DOWNLOAD_PAUSE", 20)  # segundos entre downloads seguidos
 RTMP_URL = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
+
+
+def ytdlp_cmd() -> list:
+    """Comando base do yt-dlp, com cookies (se existirem) e ritmo reduzido
+    para não disparar o bloqueio anti-robô do YouTube em IPs de datacenter."""
+    cmd = ["yt-dlp", "--sleep-requests", "1", "--retries", "5",
+           "--retry-sleep", "10"]
+    if COOKIES_FILE.exists():
+        cmd += ["--cookies", str(COOKIES_FILE)]
+    return cmd
 
 restart_event = threading.Event()   # avisa o streamer que a playlist mudou
 playlist_lock = threading.Lock()
@@ -198,8 +210,8 @@ def prepare_bumper() -> None:
 
 def latest_video_ids() -> list:
     """IDs dos últimos MAX_VIDEOS uploads do canal, do mais novo ao mais antigo."""
-    r = run([
-        "yt-dlp", "--flat-playlist", "--playlist-end", str(MAX_VIDEOS),
+    r = run(ytdlp_cmd() + [
+        "--flat-playlist", "--playlist-end", str(MAX_VIDEOS),
         "--print", "%(id)s", CHANNEL_URL,
     ])
     if r.returncode != 0:
@@ -219,8 +231,7 @@ def download_and_normalize(video_id: str) -> bool:
     srt = TMP_DIR / f"{video_id}.srt"
 
     log(f"Baixando {video_id}...")
-    r = run([
-        "yt-dlp",
+    r = run(ytdlp_cmd() + [
         "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
         "--merge-output-format", "mp4",
         "-o", str(raw),
@@ -290,15 +301,17 @@ def watcher() -> None:
             ids = latest_video_ids()
             if ids:
                 new = [i for i in ids if not (VIDEO_DIR / f"{i}.ts").exists()]
-                changed = False
-                for vid in new:
+                for k, vid in enumerate(new):
+                    if k > 0:
+                        time.sleep(DOWNLOAD_PAUSE)  # não martelar o YouTube
                     if download_and_normalize(vid):
-                        changed = True
+                        # entra no ar imediatamente, sem esperar o lote todo
+                        write_playlist(ids)
+                        restart_event.set()
+                        log(f"{vid} entrou no loop.")
                 prune_old(ids)
-                if changed or restart_event.is_set() or not PLAYLIST.exists():
+                if not PLAYLIST.exists():
                     write_playlist(ids)
-                    log("Playlist atualizada — reiniciando transmissão.")
-                    restart_event.set()
         except Exception as e:
             log(f"ERRO inesperado no monitor: {e}")
         time.sleep(CHECK_INTERVAL)
@@ -349,10 +362,13 @@ def check_tools() -> None:
     if BURN_SUBTITLES:
         try:
             import faster_whisper  # noqa: F401
-        except ImportError:
-            sys.exit("ERRO: instale o faster-whisper para as legendas:\n"
-                     "  pip install faster-whisper\n"
-                     "(ou desative com BURN_SUBTITLES = False)")
+        except ImportError as e:
+            sys.exit(
+                f"ERRO ao importar o faster-whisper: {e}\n\n"
+                f"Python em uso: {sys.executable}\n"
+                "Instale no MESMO Python que executa este script:\n"
+                "  python -m pip install faster-whisper\n"
+                "(ou desative as legendas com BURN_SUBTITLES = False no config.py)")
 
 
 def main() -> None:
