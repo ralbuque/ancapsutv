@@ -4,7 +4,13 @@ tmp/
 playlist.txt
 playlist_new.txt
 *.tmp
+*.srt
 bumper.ts
 vinheta.mp4
+chamada.mp4
+continuidade.mp4
+chamada.ts
+continuidade.ts
+shorts/
 __pycache__/
 cookies.txt

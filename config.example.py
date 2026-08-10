@@ -35,6 +35,15 @@ INTRO_BANNER = True
 INTRO_SECONDS = 30
 INTRO_FONT = "C:/Windows/Fonts/arialbd.ttf"  # fonte do título
 
+# --- Bloco promocional do outro canal (alterna com a vinheta) ---
+# Sequência: chamada.mp4 -> um short do outro canal -> continuidade.mp4
+PROMO_ENABLED = False
+PROMO_CHANNEL_URL = "https://www.youtube.com/@SEU_OUTRO_CANAL/shorts"
+PROMO_INTRO_NAME = "chamada.mp4"        # "Conheça nosso projeto..."
+PROMO_OUTRO_NAME = "continuidade.mp4"   # "Continue agora com a TV ANCAPSU"
+PROMO_MAX_SHORTS = 10  # rodízio com os N shorts mais recentes
+PROMO_EVERY = 2        # 2 = alterna vinheta/promo; 3 = promo a cada 3 intervalos
+
 # --- Publicação automática no X (ex-Twitter) ---
 # Credenciais em developer.x.com (app com permissão Read and Write, OAuth 1.0a)
 X_ENABLED = False

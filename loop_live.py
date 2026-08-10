@@ -83,6 +83,15 @@ X_IF_TOO_LONG = _get("X_IF_TOO_LONG", "trim")  # "trim" corta / "skip" não post
 X_ENDCARD = _get("X_ENDCARD", True)  # tela "veja no YouTube" nos posts cortados
 # Reply automático ao post com o link do YouTube ("" desativa)
 X_REPLY_TEMPLATE = _get("X_REPLY_TEMPLATE", "Veja o vídeo completo em {url}")
+
+# Bloco promocional do outro canal (alterna com a vinheta nos intervalos):
+# chamada.mp4 -> um short do outro canal -> continuidade.mp4
+PROMO_ENABLED = _get("PROMO_ENABLED", False)
+PROMO_CHANNEL_URL = _get("PROMO_CHANNEL_URL", "")   # ex.: .../@canal/shorts
+PROMO_INTRO_NAME = _get("PROMO_INTRO_NAME", "chamada.mp4")
+PROMO_OUTRO_NAME = _get("PROMO_OUTRO_NAME", "continuidade.mp4")
+PROMO_MAX_SHORTS = _get("PROMO_MAX_SHORTS", 10)  # tamanho do rodízio de shorts
+PROMO_EVERY = _get("PROMO_EVERY", 2)  # 2 = alterna vinheta/promo nos intervalos
 X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 
 # Banner de abertura (thumbnail + título no topo da tela)
@@ -99,6 +108,22 @@ PLAYLIST = BASE_DIR / "playlist.txt"
 PLAYLIST_PENDING = BASE_DIR / "playlist_new.txt"
 BUMPER_SOURCE = BASE_DIR / BUMPER_SOURCE_NAME
 BUMPER_TS = BASE_DIR / "bumper.ts"
+SHORTS_DIR = BASE_DIR / "shorts"
+PROMO_INTRO_SRC = BASE_DIR / PROMO_INTRO_NAME
+PROMO_OUTRO_SRC = BASE_DIR / PROMO_OUTRO_NAME
+PROMO_INTRO_TS = BASE_DIR / "chamada.ts"
+PROMO_OUTRO_TS = BASE_DIR / "continuidade.ts"
+
+# parâmetros de codificação compartilhados (todos os .ts precisam ser idênticos
+# para a emenda por cópia direta funcionar)
+def _encode_args() -> list:
+    return ["-c:v", "libx264", "-preset", X264_PRESET,
+            "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE,
+            "-bufsize", "9000k",
+            "-g", str(FPS * 2), "-keyint_min", str(FPS * 2),
+            "-sc_threshold", "0",
+            "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", "44100", "-ac", "2",
+            "-f", "mpegts"]
 COOKIES_FILE = BASE_DIR / "cookies.txt"
 VOCAB_FILE = BASE_DIR / "vocabulario.txt"    # nomes próprios e siglas, 1 por linha
 FIXES_FILE = BASE_DIR / "correcoes.txt"      # linhas "errado => certo"
@@ -271,13 +296,7 @@ def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None,
 
     if t_limit is not None:
         cmd += ["-t", f"{t_limit:.3f}"]
-    cmd += [
-        "-c:v", "libx264", "-preset", X264_PRESET,
-        "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE, "-bufsize", "9000k",
-        "-g", str(FPS * 2), "-keyint_min", str(FPS * 2), "-sc_threshold", "0",
-        "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", "44100", "-ac", "2",
-        "-f", "mpegts", tmp_out.name,
-    ]
+    cmd += _encode_args() + [tmp_out.name]
     r = run(cmd, cwd=str(workdir))
     if r.returncode != 0 or not tmp_out.exists():
         log(f"ERRO na normalização de {src.name}: {r.stderr.strip()[:400]}")
@@ -287,19 +306,61 @@ def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None,
     return True
 
 
-def prepare_bumper() -> None:
-    """(Re)normaliza a vinheta quando o arquivo fonte é novo ou mudou."""
-    if not BUMPER_SOURCE.exists():
-        if not BUMPER_TS.exists():
-            log(f"AVISO: '{BUMPER_SOURCE_NAME}' não encontrado — "
-                "o loop rodará SEM vinheta entre os vídeos.")
+def normalize_short(src: Path, dst: Path) -> bool:
+    """Converte um short vertical para o formato da live, centralizado sobre
+    o próprio vídeo desfocado preenchendo as laterais."""
+    workdir = src.parent
+    tmp_out = workdir / (dst.stem + ".part.ts")
+    fc = (f"[0:v]split=2[a][b];"
+          f"[a]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+          f"crop={WIDTH}:{HEIGHT},boxblur=20:5[bg];"
+          f"[b]scale=-2:{HEIGHT}[fg];"
+          f"[bg][fg]overlay=(W-w)/2:(H-h)/2,fps={FPS},format=yuv420p[vout]")
+    cmd = (["ffmpeg", "-y", "-i", src.name, "-filter_complex", fc,
+            "-map", "[vout]", "-map", "0:a?"]
+           + _encode_args() + [tmp_out.name])
+    r = run(cmd, cwd=str(workdir))
+    if r.returncode != 0 or not tmp_out.exists():
+        log(f"ERRO na normalização do short {src.name}: "
+            f"{r.stderr.strip()[:300]}")
+        tmp_out.unlink(missing_ok=True)
+        return False
+    shutil.move(str(tmp_out), str(dst))
+    return True
+
+
+def prepare_static(src: Path, dst: Path, label: str) -> None:
+    """(Re)normaliza um vídeo fixo (vinheta/chamada/continuidade) se mudou,
+    com legendas queimadas como nos vídeos normais."""
+    if not src.exists():
+        if not dst.exists():
+            log(f"AVISO: '{src.name}' não encontrado — seguindo sem {label}.")
         return
-    if BUMPER_TS.exists() and BUMPER_TS.stat().st_mtime >= BUMPER_SOURCE.stat().st_mtime:
+    if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
         return
-    log("Normalizando a vinheta...")
-    if normalize(BUMPER_SOURCE, BUMPER_TS):
-        log("Vinheta pronta.")
+    srt = src.with_suffix(".srt")
+    srt_ok = None
+    if BURN_SUBTITLES:
+        try:
+            log(f"Transcrevendo {label} ({src.name})...")
+            if generate_srt(src, srt):
+                srt_ok = srt
+        except Exception as e:
+            log(f"AVISO: falha ao legendar {label} ({e}) — seguindo sem legenda.")
+    log(f"Normalizando {label} ({src.name})...")
+    if normalize(src, dst, srt=srt_ok):
+        log(f"Pronto: {label}.")
         restart_event.set()
+    safe_unlink(srt)
+
+
+def prepare_bumper() -> None:
+    prepare_static(BUMPER_SOURCE, BUMPER_TS, "a vinheta")
+    if PROMO_ENABLED:
+        prepare_static(PROMO_INTRO_SRC, PROMO_INTRO_TS,
+                       "a chamada do outro canal")
+        prepare_static(PROMO_OUTRO_SRC, PROMO_OUTRO_TS,
+                       "a vinheta de continuidade")
 
 
 # ------------------------- POST NO X ----------------------------------
@@ -584,15 +645,64 @@ def download_and_normalize(video_id: str):
     return ok, title
 
 
+def sync_shorts() -> None:
+    """Baixa e converte os shorts mais recentes do outro canal (rodízio)."""
+    if not PROMO_ENABLED or not PROMO_CHANNEL_URL:
+        return
+    SHORTS_DIR.mkdir(exist_ok=True)
+    r = run(ytdlp_cmd() + [
+        "--flat-playlist", "--playlist-end", str(PROMO_MAX_SHORTS),
+        "--print", "%(id)s", PROMO_CHANNEL_URL,
+    ])
+    if r.returncode != 0:
+        log(f"ERRO ao consultar o canal do promo: {r.stderr.strip()[:200]}")
+        return
+    ids = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    for sid in [i for i in ids if not (SHORTS_DIR / f"{i}.ts").exists()]:
+        time.sleep(DOWNLOAD_PAUSE)
+        TMP_DIR.mkdir(exist_ok=True)
+        raw = TMP_DIR / f"s_{sid}.mp4"
+        log(f"Baixando short {sid}...")
+        r2 = run(ytdlp_cmd() + [
+            "-f", "bv*[height<=1920]+ba/b",
+            "--merge-output-format", "mp4",
+            "-o", str(raw),
+            f"https://www.youtube.com/watch?v={sid}",
+        ])
+        if r2.returncode != 0 or not raw.exists():
+            log(f"ERRO no download do short {sid}: {r2.stderr.strip()[:200]}")
+            continue
+        if normalize_short(raw, SHORTS_DIR / f"{sid}.ts"):
+            log(f"Short {sid} pronto.")
+        safe_unlink(raw)
+    keep = {f"{i}.ts" for i in ids}
+    for f in SHORTS_DIR.glob("*.ts"):
+        if f.name not in keep:
+            log(f"Removendo short antigo: {f.name}")
+            safe_unlink(f)
+
+
 def build_playlist_text(ids_newest_first: list) -> str:
-    """Playlist em ordem cronológica, com a vinheta entre os vídeos."""
+    """Playlist em ordem cronológica. Nos intervalos, alterna a vinheta com o
+    bloco promocional (chamada -> short do outro canal -> continuidade)."""
     available = [i for i in ids_newest_first if (VIDEO_DIR / f"{i}.ts").exists()]
     bumper = f"file '{BUMPER_TS.as_posix()}'" if BUMPER_TS.exists() else None
-    lines = []
-    for i in reversed(available):
+    shorts = (sorted(SHORTS_DIR.glob("*.ts"),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+              if SHORTS_DIR.exists() else [])
+    promo_ok = (PROMO_ENABLED and PROMO_EVERY > 0 and shorts
+                and PROMO_INTRO_TS.exists() and PROMO_OUTRO_TS.exists())
+    lines, slot = [], 0
+    for idx, i in enumerate(reversed(available)):
         lines.append(f"file '{(VIDEO_DIR / f'{i}.ts').as_posix()}'")
-        if bumper:
-            lines.append(bumper)  # também toca entre o último e o primeiro do loop
+        if promo_ok and idx % PROMO_EVERY == PROMO_EVERY - 1:
+            s = shorts[slot % len(shorts)]
+            slot += 1
+            lines += [f"file '{PROMO_INTRO_TS.as_posix()}'",
+                      f"file '{s.as_posix()}'",
+                      f"file '{PROMO_OUTRO_TS.as_posix()}'"]
+        elif bumper:
+            lines.append(bumper)  # também entre o último e o primeiro do loop
     return "\n".join(lines) + "\n" if lines else ""
 
 
@@ -642,6 +752,7 @@ def watcher() -> None:
                         log(f"{vid} entrou no loop.")
                         post_to_x(vid, title or "")
                 prune_old(ids)
+                sync_shorts()
                 sync_playlist(ids)  # cobre remoções e recupera atualizações perdidas
         except Exception as e:
             log(f"ERRO inesperado no monitor: {e}")
