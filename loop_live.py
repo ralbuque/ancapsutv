@@ -21,6 +21,7 @@ Requisitos no Windows: Python 3.9+, ffmpeg.exe e yt-dlp.exe no PATH,
 e "pip install faster-whisper" para as legendas. Veja o README.md.
 """
 
+import json
 import os
 import re
 import shutil
@@ -495,7 +496,7 @@ def download_and_normalize(video_id: str):
     r = run(ytdlp_cmd() + [
         "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
         "--merge-output-format", "mp4",
-        "--no-simulate", "--print", "%(title)s",
+        "--write-info-json",
         "--write-thumbnail", "--convert-thumbnails", "jpg",
         "-o", str(raw),
         f"https://www.youtube.com/watch?v={video_id}",
@@ -503,7 +504,17 @@ def download_and_normalize(video_id: str):
     if r.returncode != 0 or not raw.exists():
         log(f"ERRO no download de {video_id}: {r.stderr.strip()[:400]}")
         return False, None
-    title = (r.stdout.strip().splitlines() or [""])[0]
+
+    # título lido do .info.json (sempre UTF-8 — o stdout do yt-dlp.exe sai na
+    # codificação regional do Windows e corrompe acentos)
+    title = ""
+    info = TMP_DIR / f"{video_id}.info.json"
+    if info.exists():
+        try:
+            title = json.loads(info.read_text(encoding="utf-8")).get("title", "")
+        except Exception as e:
+            log(f"AVISO: falha ao ler o título de {video_id}: {e}")
+        info.unlink(missing_ok=True)
 
     # banner de abertura: thumbnail (baixada acima) + título em arquivo
     thumb = TMP_DIR / f"{video_id}.jpg"
