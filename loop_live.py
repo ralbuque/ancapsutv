@@ -22,6 +22,7 @@ e "pip install faster-whisper" para as legendas. Veja o README.md.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -80,6 +81,11 @@ X_MAX_VIDEO_SECONDS = _get("X_MAX_VIDEO_SECONDS", 140)
 X_IF_TOO_LONG = _get("X_IF_TOO_LONG", "trim")  # "trim" corta / "skip" não posta
 X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 
+# Banner de abertura (thumbnail + título no topo da tela)
+INTRO_BANNER = _get("INTRO_BANNER", True)
+INTRO_SECONDS = _get("INTRO_SECONDS", 30)
+INTRO_FONT = _get("INTRO_FONT", "C:/Windows/Fonts/arialbd.ttf")
+
 # ======================================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -90,6 +96,8 @@ PLAYLIST_PENDING = BASE_DIR / "playlist_new.txt"
 BUMPER_SOURCE = BASE_DIR / BUMPER_SOURCE_NAME
 BUMPER_TS = BASE_DIR / "bumper.ts"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
+VOCAB_FILE = BASE_DIR / "vocabulario.txt"    # nomes próprios e siglas, 1 por linha
+FIXES_FILE = BASE_DIR / "correcoes.txt"      # linhas "errado => certo"
 DOWNLOAD_PAUSE = _get("DOWNLOAD_PAUSE", 20)  # segundos entre downloads seguidos
 RTMP_URL = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
 
@@ -147,15 +155,50 @@ def srt_time(t: float) -> str:
     return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int((t % 1) * 1000):03d}"
 
 
+def load_vocab() -> list:
+    """Nomes próprios/siglas de vocabulario.txt (1 por linha, # comenta)."""
+    if not VOCAB_FILE.exists():
+        return []
+    return [l.strip() for l in
+            VOCAB_FILE.read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.strip().startswith("#")]
+
+
+def load_fixes() -> list:
+    """Pares (errado, certo) de correcoes.txt, formato: errado => certo."""
+    fixes = []
+    if FIXES_FILE.exists():
+        for l in FIXES_FILE.read_text(encoding="utf-8").splitlines():
+            if "=>" in l and not l.strip().startswith("#"):
+                wrong, right = l.split("=>", 1)
+                if wrong.strip():
+                    fixes.append((wrong.strip(), right.strip()))
+    return fixes
+
+
+def apply_fixes(text: str, fixes: list) -> str:
+    for wrong, right in fixes:
+        text = re.sub(re.escape(wrong), right, text, flags=re.IGNORECASE)
+    return text
+
+
 def generate_srt(video_path: Path, srt_path: Path) -> bool:
     """Transcreve o vídeo e grava um .srt. Retorna False se não houver fala."""
     model = get_whisper()
+    kw = {}
+    terms = load_vocab()
+    if terms:
+        joined = ", ".join(terms)
+        kw["hotwords"] = joined
+        kw["initial_prompt"] = ("Transcrição de noticiário em português do "
+                                f"Brasil. Vocabulário: {joined}.")
     segments, _info = model.transcribe(str(video_path), language="pt",
-                                       vad_filter=True)
+                                       vad_filter=True, **kw)
+    fixes = load_fixes()
     entries = []
     n = 0
     for seg in segments:
-        text = seg.text.strip()
+        text = apply_fixes(seg.text.strip(), fixes)
         if not text:
             continue
         n += 1
@@ -170,27 +213,53 @@ def generate_srt(video_path: Path, srt_path: Path) -> bool:
 
 # --------------------------- NORMALIZAÇÃO -----------------------------
 
-def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None) -> bool:
+def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None,
+              thumb: Path = None, title_txt: Path = None) -> bool:
     """Converte src para o formato padrão .ts em dst.
 
     t_limit: duração máxima em segundos (corta o final).
-    srt: arquivo .srt para queimar no vídeo (deve estar na MESMA pasta de src —
-         o ffmpeg roda com cwd nessa pasta para evitar problemas de escape
-         de caminhos do Windows no filtro subtitles).
+    srt: arquivo .srt para queimar no vídeo.
+    thumb/title_txt: se presentes, desenha o banner de abertura (faixa no topo
+        com a thumbnail e o título) nos primeiros INTRO_SECONDS segundos.
+    Todos os arquivos auxiliares devem estar na MESMA pasta de src — o ffmpeg
+    roda com cwd nessa pasta para evitar problemas de escape de caminhos do
+    Windows nos filtros.
     """
     workdir = src.parent
-    vf = (f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
-          f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={FPS}")
-    if srt is not None:
-        vf += f",subtitles={srt.name}:force_style='{SUBTITLE_STYLE}'"
-    vf += ",format=yuv420p"
+    base = (f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={FPS}")
+    tail = (f"subtitles={srt.name}:force_style='{SUBTITLE_STYLE}',"
+            if srt is not None else "")
 
     tmp_out = workdir / (dst.stem + ".part.ts")
     cmd = ["ffmpeg", "-y", "-i", src.name]
+
+    banner = (INTRO_BANNER and thumb is not None and thumb.exists()
+              and title_txt is not None and title_txt.exists())
+    if banner:
+        bar_h, th_w, th_h, pad = 168, 214, 120, 24
+        show = f"enable='lt(t,{INTRO_SECONDS})'"
+        font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
+                if Path(INTRO_FONT).exists() else "")
+        fc = (
+            f"[0:v]{base}[b0];"
+            f"[b0]drawbox=x=0:y=0:w=iw:h={bar_h}:color=black@0.55:"
+            f"t=fill:{show}[b1];"
+            f"[1:v]scale={th_w}:{th_h}[th];"
+            f"[b1][th]overlay=x={pad}:y={(bar_h - th_h) // 2}:{show}[b2];"
+            f"[b2]drawtext={font}textfile={title_txt.name}:fontsize=34:"
+            f"fontcolor=white:line_spacing=10:x={pad * 2 + th_w}:"
+            f"y=({bar_h}-th)/2:{show}[b3];"
+            f"[b3]{tail}format=yuv420p[vout]"
+        )
+        cmd += ["-i", thumb.name, "-filter_complex", fc,
+                "-map", "[vout]", "-map", "0:a?"]
+    else:
+        cmd += ["-vf", f"{base},{tail}format=yuv420p"]
+
     if t_limit is not None:
         cmd += ["-t", f"{t_limit:.3f}"]
     cmd += [
-        "-vf", vf,
         "-c:v", "libx264", "-preset", X264_PRESET,
         "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE, "-bufsize", "9000k",
         "-g", str(FPS * 2), "-keyint_min", str(FPS * 2), "-sc_threshold", "0",
@@ -295,16 +364,17 @@ def post_to_x(video_id: str, title: str) -> None:
             send(mp4, category)
             log(f"X: postado {video_id}.")
         except Exception as e:
-            if category == "amplify_video" and (
-                    "2 minutes" in str(e) or "duration" in str(e).lower()):
-                log(f"X: vídeo longo recusado ({e}) — "
-                    "postando os primeiros 140s como fallback.")
-                r = run(["ffmpeg", "-y", "-i", str(mp4), "-t", "140",
+            m = re.search(r"longer than (\d+) minutes?", str(e))
+            if category == "amplify_video" and m:
+                limit = int(m.group(1)) * 60 - 1  # 1s de margem
+                log(f"X: a conta aceita no máximo {m.group(1)} min via API — "
+                    f"postando os primeiros {limit}s como fallback.")
+                r = run(["ffmpeg", "-y", "-i", str(mp4), "-t", str(limit),
                          "-c", "copy", "-movflags", "+faststart", str(short)])
                 if r.returncode != 0:
                     raise
-                send(short, "tweet_video")
-                log(f"X: postado {video_id} (cortado em 140s).")
+                send(short, "amplify_video" if limit > 140 else "tweet_video")
+                log(f"X: postado {video_id} (cortado em {limit}s).")
             else:
                 raise
     except Exception as e:
@@ -344,6 +414,7 @@ def download_and_normalize(video_id: str):
         "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
         "--merge-output-format", "mp4",
         "--no-simulate", "--print", "%(title)s",
+        "--write-thumbnail", "--convert-thumbnails", "jpg",
         "-o", str(raw),
         f"https://www.youtube.com/watch?v={video_id}",
     ])
@@ -351,6 +422,13 @@ def download_and_normalize(video_id: str):
         log(f"ERRO no download de {video_id}: {r.stderr.strip()[:400]}")
         return False, None
     title = (r.stdout.strip().splitlines() or [""])[0]
+
+    # banner de abertura: thumbnail (baixada acima) + título em arquivo
+    thumb = TMP_DIR / f"{video_id}.jpg"
+    title_txt = TMP_DIR / f"{video_id}.txt"
+    if INTRO_BANNER and title:
+        wrapped = textwrap.wrap(title, width=80)[:3]
+        title_txt.write_text("\n".join(wrapped), encoding="utf-8")
 
     # corte dos segundos finais
     t_limit = None
@@ -373,9 +451,12 @@ def download_and_normalize(video_id: str):
             log(f"AVISO: falha ao legendar {video_id} ({e}) — seguindo sem legenda.")
 
     log(f"Normalizando {video_id}...")
-    ok = normalize(raw, out_file, t_limit=t_limit, srt=srt_ok)
+    ok = normalize(raw, out_file, t_limit=t_limit, srt=srt_ok,
+                   thumb=thumb, title_txt=title_txt)
     raw.unlink(missing_ok=True)
     srt.unlink(missing_ok=True)
+    thumb.unlink(missing_ok=True)
+    title_txt.unlink(missing_ok=True)
     if ok:
         log(f"Pronto: {out_file.name}")
     return ok, title

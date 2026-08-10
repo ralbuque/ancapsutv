@@ -1,0 +1,6 @@
+# Correções aplicadas ao texto da legenda depois da transcrição.
+# Formato: errado => certo   (sem diferenciar maiúsculas no lado errado)
+# Use para erros que o Whisper insiste em cometer mesmo com o vocabulario.txt.
+# Exemplos (apague e coloque os seus):
+# ancap su => Ancapsu
+# an cap su => Ancapsu

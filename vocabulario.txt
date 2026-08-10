@@ -1,0 +1,13 @@
+# Nomes próprios e siglas que costumam aparecer nos vídeos, 1 por linha.
+# O Whisper usa esta lista para acertar a grafia na transcrição.
+# Dica: priorize os ~50-100 termos mais frequentes (lista muito longa perde efeito).
+# Exemplos (apague e coloque os seus):
+# Ancapsu
+# STF
+# Javier Milei
+ANACAPSU
+Peter Turguniev
+Javier Milei
+Xandão
+INSS
+Alcolumbre

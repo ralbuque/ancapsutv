@@ -30,6 +30,11 @@ VIDEO_BITRATE = "4500k"
 AUDIO_BITRATE = "160k"
 X264_PRESET = "veryfast"
 
+# --- Banner de abertura (thumbnail + título no topo, início de cada vídeo) ---
+INTRO_BANNER = True
+INTRO_SECONDS = 30
+INTRO_FONT = "C:/Windows/Fonts/arialbd.ttf"  # fonte do título
+
 # --- Publicação automática no X (ex-Twitter) ---
 # Credenciais em developer.x.com (app com permissão Read and Write, OAuth 1.0a)
 X_ENABLED = False
