@@ -1,5 +1,7 @@
+config.py
 videos/
 tmp/
 playlist.txt
+bumper.ts
 __pycache__/
 cookies.txt

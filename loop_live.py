@@ -6,44 +6,67 @@ loop_live.py — Live 24/7 no YouTube com os últimos vídeos do seu canal em lo
 Como funciona:
   1. A cada CHECK_INTERVAL segundos, consulta o canal (yt-dlp) e pega os IDs
      dos últimos MAX_VIDEOS vídeos publicados.
-  2. Baixa os que ainda não tem e normaliza (mesma resolução/fps/codec)
-     para que a emenda entre vídeos seja perfeita.
-  3. Mantém playlist.txt com os vídeos em ordem cronológica (mais antigo primeiro).
+  2. Baixa os que ainda não tem, corta os CUT_END_SECONDS segundos finais,
+     gera legendas com Whisper (local) e as queima no vídeo, e normaliza
+     (mesma resolução/fps/codec) para a emenda entre vídeos ser perfeita.
+  3. Mantém playlist.txt em ordem cronológica, com a vinheta (vinheta.mp4)
+     intercalada entre todos os vídeos.
   4. Um processo FFmpeg transmite a playlist em loop infinito (-stream_loop -1)
      para o RTMP do YouTube usando "-c copy" (quase zero CPU).
   5. Quando entra vídeo novo, o FFmpeg é reiniciado com a playlist atualizada
      (interrupção de ~2 a 5 segundos, o YouTube segura a live no ar).
   6. Vídeos que saíram da lista dos últimos MAX_VIDEOS são apagados do disco.
 
-Requisitos no Windows: Python 3.9+, ffmpeg.exe e yt-dlp.exe no PATH
-(ou na mesma pasta deste script). Veja o README.md.
+Requisitos no Windows: Python 3.9+, ffmpeg.exe e yt-dlp.exe no PATH,
+e "pip install faster-whisper" para as legendas. Veja o README.md.
 """
 
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 # ============================ CONFIGURAÇÃO ============================
+# As configurações ficam em config.py (fora do versionamento).
+# Copie config.example.py para config.py e preencha seus dados.
 
-# URL da aba "Vídeos" do seu canal (use /videos para pegar só uploads, sem lives)
-CHANNEL_URL = "https://www.youtube.com/@SEU_CANAL/videos"
+try:
+    import config as _cfg
+except ImportError:
+    sys.exit("ERRO: arquivo config.py não encontrado.\n"
+             "Copie config.example.py para config.py e preencha "
+             "CHANNEL_URL e STREAM_KEY.")
 
-# Chave de transmissão da sua live persistente (YouTube Studio > Transmitir ao vivo)
-STREAM_KEY = "xxxx-xxxx-xxxx-xxxx-xxxx"
 
-MAX_VIDEOS = 20          # quantos vídeos ficam no loop
-CHECK_INTERVAL = 300     # segundos entre verificações do canal (300 = 5 min)
+def _get(name, default=None, required=False):
+    val = getattr(_cfg, name, default)
+    if required and (val is None or "SEU_CANAL" in str(val) or str(val).startswith("xxxx")):
+        sys.exit(f"ERRO: configure {name} no config.py.")
+    return val
 
-# Formato padrão de normalização (todos os vídeos são convertidos para isso)
-WIDTH, HEIGHT = 1920, 1080
-FPS = 30
-VIDEO_BITRATE = "4500k"  # recomendação do YouTube para 1080p30
-AUDIO_BITRATE = "160k"
-X264_PRESET = "veryfast"  # use "faster"/"fast" se o servidor tiver CPU sobrando
+
+CHANNEL_URL = _get("CHANNEL_URL", required=True)
+STREAM_KEY = _get("STREAM_KEY", required=True)
+MAX_VIDEOS = _get("MAX_VIDEOS", 20)
+CHECK_INTERVAL = _get("CHECK_INTERVAL", 300)
+BUMPER_SOURCE_NAME = _get("BUMPER_SOURCE_NAME", "vinheta.mp4")
+CUT_END_SECONDS = _get("CUT_END_SECONDS", 10)
+BURN_SUBTITLES = _get("BURN_SUBTITLES", True)
+WHISPER_MODEL = _get("WHISPER_MODEL", "small")
+SUBTITLE_STYLE = _get("SUBTITLE_STYLE",
+                      "FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,"
+                      "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
+                      "Shadow=0,MarginV=30")
+WIDTH = _get("WIDTH", 1920)
+HEIGHT = _get("HEIGHT", 1080)
+FPS = _get("FPS", 30)
+VIDEO_BITRATE = _get("VIDEO_BITRATE", "4500k")
+AUDIO_BITRATE = _get("AUDIO_BITRATE", "160k")
+X264_PRESET = _get("X264_PRESET", "veryfast")
 
 # ======================================================================
 
@@ -51,10 +74,13 @@ BASE_DIR = Path(__file__).resolve().parent
 VIDEO_DIR = BASE_DIR / "videos"
 TMP_DIR = BASE_DIR / "tmp"
 PLAYLIST = BASE_DIR / "playlist.txt"
+BUMPER_SOURCE = BASE_DIR / BUMPER_SOURCE_NAME
+BUMPER_TS = BASE_DIR / "bumper.ts"
 RTMP_URL = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
 
 restart_event = threading.Event()   # avisa o streamer que a playlist mudou
 playlist_lock = threading.Lock()
+_whisper_model = None
 
 
 def log(msg: str) -> None:
@@ -64,6 +90,108 @@ def log(msg: str) -> None:
 def run(cmd: list, **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", **kw)
+
+
+def video_duration(path: Path):
+    r = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)])
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+# ---------------------------- LEGENDAS --------------------------------
+
+def get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        log(f"Carregando modelo Whisper '{WHISPER_MODEL}' "
+            "(na primeira execução o modelo é baixado)...")
+        _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu",
+                                      compute_type="int8")
+    return _whisper_model
+
+
+def srt_time(t: float) -> str:
+    h, rem = divmod(t, 3600)
+    m, s = divmod(rem, 60)
+    return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int((t % 1) * 1000):03d}"
+
+
+def generate_srt(video_path: Path, srt_path: Path) -> bool:
+    """Transcreve o vídeo e grava um .srt. Retorna False se não houver fala."""
+    model = get_whisper()
+    segments, _info = model.transcribe(str(video_path), language="pt",
+                                       vad_filter=True)
+    entries = []
+    n = 0
+    for seg in segments:
+        text = seg.text.strip()
+        if not text:
+            continue
+        n += 1
+        wrapped = "\n".join(textwrap.wrap(text, width=45))
+        entries.append(f"{n}\n{srt_time(seg.start)} --> {srt_time(seg.end)}\n"
+                       f"{wrapped}\n")
+    if not entries:
+        return False
+    srt_path.write_text("\n".join(entries), encoding="utf-8")
+    return True
+
+
+# --------------------------- NORMALIZAÇÃO -----------------------------
+
+def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None) -> bool:
+    """Converte src para o formato padrão .ts em dst.
+
+    t_limit: duração máxima em segundos (corta o final).
+    srt: arquivo .srt para queimar no vídeo (deve estar na MESMA pasta de src —
+         o ffmpeg roda com cwd nessa pasta para evitar problemas de escape
+         de caminhos do Windows no filtro subtitles).
+    """
+    workdir = src.parent
+    vf = (f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+          f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={FPS}")
+    if srt is not None:
+        vf += f",subtitles={srt.name}:force_style='{SUBTITLE_STYLE}'"
+    vf += ",format=yuv420p"
+
+    tmp_out = workdir / (dst.stem + ".part.ts")
+    cmd = ["ffmpeg", "-y", "-i", src.name]
+    if t_limit is not None:
+        cmd += ["-t", f"{t_limit:.3f}"]
+    cmd += [
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", X264_PRESET,
+        "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE, "-bufsize", "9000k",
+        "-g", str(FPS * 2), "-keyint_min", str(FPS * 2), "-sc_threshold", "0",
+        "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", "44100", "-ac", "2",
+        "-f", "mpegts", tmp_out.name,
+    ]
+    r = run(cmd, cwd=str(workdir))
+    if r.returncode != 0 or not tmp_out.exists():
+        log(f"ERRO na normalização de {src.name}: {r.stderr.strip()[:400]}")
+        tmp_out.unlink(missing_ok=True)
+        return False
+    shutil.move(str(tmp_out), str(dst))
+    return True
+
+
+def prepare_bumper() -> None:
+    """(Re)normaliza a vinheta quando o arquivo fonte é novo ou mudou."""
+    if not BUMPER_SOURCE.exists():
+        if not BUMPER_TS.exists():
+            log(f"AVISO: '{BUMPER_SOURCE_NAME}' não encontrado — "
+                "o loop rodará SEM vinheta entre os vídeos.")
+        return
+    if BUMPER_TS.exists() and BUMPER_TS.stat().st_mtime >= BUMPER_SOURCE.stat().st_mtime:
+        return
+    log("Normalizando a vinheta...")
+    if normalize(BUMPER_SOURCE, BUMPER_TS):
+        log("Vinheta pronta.")
+        restart_event.set()
 
 
 # ---------------------------- MONITOR ---------------------------------
@@ -81,13 +209,14 @@ def latest_video_ids() -> list:
 
 
 def download_and_normalize(video_id: str) -> bool:
-    """Baixa o vídeo e converte para .ts padronizado em VIDEO_DIR."""
+    """Baixa, corta o final, legenda e converte para .ts padronizado."""
     out_file = VIDEO_DIR / f"{video_id}.ts"
     if out_file.exists():
         return True
 
     TMP_DIR.mkdir(exist_ok=True)
     raw = TMP_DIR / f"{video_id}.mp4"
+    srt = TMP_DIR / f"{video_id}.srt"
 
     log(f"Baixando {video_id}...")
     r = run([
@@ -101,35 +230,44 @@ def download_and_normalize(video_id: str) -> bool:
         log(f"ERRO no download de {video_id}: {r.stderr.strip()[:400]}")
         return False
 
-    log(f"Normalizando {video_id}...")
-    vf = (f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
-          f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p")
-    tmp_out = TMP_DIR / f"{video_id}.ts"
-    r = run([
-        "ffmpeg", "-y", "-i", str(raw),
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", X264_PRESET,
-        "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE, "-bufsize", "9000k",
-        "-g", str(FPS * 2), "-keyint_min", str(FPS * 2), "-sc_threshold", "0",
-        "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", "44100", "-ac", "2",
-        "-f", "mpegts", str(tmp_out),
-    ])
-    raw.unlink(missing_ok=True)
-    if r.returncode != 0 or not tmp_out.exists():
-        log(f"ERRO na normalização de {video_id}: {r.stderr.strip()[:400]}")
-        tmp_out.unlink(missing_ok=True)
-        return False
+    # corte dos segundos finais
+    t_limit = None
+    dur = video_duration(raw)
+    if dur and dur > CUT_END_SECONDS + 5:
+        t_limit = dur - CUT_END_SECONDS
+    elif dur:
+        log(f"AVISO: {video_id} é muito curto ({dur:.0f}s) — não vou cortar o final.")
 
-    shutil.move(str(tmp_out), str(out_file))
-    log(f"Pronto: {out_file.name}")
-    return True
+    # legendas
+    srt_ok = None
+    if BURN_SUBTITLES:
+        try:
+            log(f"Transcrevendo {video_id} (Whisper)...")
+            if generate_srt(raw, srt):
+                srt_ok = srt
+            else:
+                log(f"AVISO: nenhuma fala detectada em {video_id} — sem legenda.")
+        except Exception as e:
+            log(f"AVISO: falha ao legendar {video_id} ({e}) — seguindo sem legenda.")
+
+    log(f"Normalizando {video_id}...")
+    ok = normalize(raw, out_file, t_limit=t_limit, srt=srt_ok)
+    raw.unlink(missing_ok=True)
+    srt.unlink(missing_ok=True)
+    if ok:
+        log(f"Pronto: {out_file.name}")
+    return ok
 
 
 def write_playlist(ids_newest_first: list) -> None:
-    """Grava playlist.txt em ordem cronológica (mais antigo primeiro)."""
+    """Grava playlist.txt em ordem cronológica, com a vinheta entre os vídeos."""
     available = [i for i in ids_newest_first if (VIDEO_DIR / f"{i}.ts").exists()]
-    lines = [f"file '{(VIDEO_DIR / f'{i}.ts').as_posix()}'"
-             for i in reversed(available)]
+    bumper = f"file '{BUMPER_TS.as_posix()}'" if BUMPER_TS.exists() else None
+    lines = []
+    for i in reversed(available):
+        lines.append(f"file '{(VIDEO_DIR / f'{i}.ts').as_posix()}'")
+        if bumper:
+            lines.append(bumper)  # também toca entre o último e o primeiro do loop
     tmp = PLAYLIST.with_suffix(".tmp")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     with playlist_lock:
@@ -148,6 +286,7 @@ def watcher() -> None:
     VIDEO_DIR.mkdir(exist_ok=True)
     while True:
         try:
+            prepare_bumper()
             ids = latest_video_ids()
             if ids:
                 new = [i for i in ids if not (VIDEO_DIR / f"{i}.ts").exists()]
@@ -156,9 +295,9 @@ def watcher() -> None:
                     if download_and_normalize(vid):
                         changed = True
                 prune_old(ids)
-                if changed or not PLAYLIST.exists():
+                if changed or restart_event.is_set() or not PLAYLIST.exists():
                     write_playlist(ids)
-                    log("Playlist atualizada — reiniciando transmissão no próximo ciclo.")
+                    log("Playlist atualizada — reiniciando transmissão.")
                     restart_event.set()
         except Exception as e:
             log(f"ERRO inesperado no monitor: {e}")
@@ -204,17 +343,24 @@ def streamer() -> None:
 # ------------------------------ MAIN ----------------------------------
 
 def check_tools() -> None:
-    for tool in ("ffmpeg", "yt-dlp"):
+    for tool in ("ffmpeg", "ffprobe", "yt-dlp"):
         if shutil.which(tool) is None:
             sys.exit(f"ERRO: '{tool}' não encontrado no PATH. Veja o README.md.")
+    if BURN_SUBTITLES:
+        try:
+            import faster_whisper  # noqa: F401
+        except ImportError:
+            sys.exit("ERRO: instale o faster-whisper para as legendas:\n"
+                     "  pip install faster-whisper\n"
+                     "(ou desative com BURN_SUBTITLES = False)")
 
 
 def main() -> None:
-    if "SEU_CANAL" in CHANNEL_URL or STREAM_KEY.startswith("xxxx"):
-        sys.exit("Configure CHANNEL_URL e STREAM_KEY no topo do arquivo antes de rodar.")
     check_tools()
     log(f"Canal: {CHANNEL_URL}")
     log(f"Loop com os últimos {MAX_VIDEOS} vídeos | verificação a cada {CHECK_INTERVAL}s")
+    log(f"Corte final: {CUT_END_SECONDS}s | Legendas: "
+        f"{'ativadas (' + WHISPER_MODEL + ')' if BURN_SUBTITLES else 'desativadas'}")
     threading.Thread(target=watcher, daemon=True, name="watcher").start()
     try:
         streamer()
