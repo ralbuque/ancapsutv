@@ -51,3 +51,10 @@ X_TEXT_TEMPLATE = "{title}"
 X_MAX_VIDEO_SECONDS = 140   # limite de contas comuns; Premium: use p.ex. 3600
 X_IF_TOO_LONG = "trim"      # "trim" = posta cortado / "skip" = não posta
 X_TARGET_SIZE_MB = 500      # acima disso, a cópia do X é recomprimida em 720p
+X_ENDCARD = True            # em posts cortados, os 10s finais viram a tela
+                            # "Veja o vídeo completo no YouTube" com thumb+link
+
+# Reply automático ao post com o link do YouTube (em TODO post, cortado ou não).
+# Custo: reply com link ≈ US$0,20 cada no pay-per-use (~US$60/mês com 10/dia).
+# Deixe "" para desativar.
+X_REPLY_TEMPLATE = "Veja o vídeo completo em {url}"

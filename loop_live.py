@@ -79,6 +79,9 @@ X_ACCESS_TOKEN_SECRET = _get("X_ACCESS_TOKEN_SECRET", "")
 X_TEXT_TEMPLATE = _get("X_TEXT_TEMPLATE", "{title}")
 X_MAX_VIDEO_SECONDS = _get("X_MAX_VIDEO_SECONDS", 140)
 X_IF_TOO_LONG = _get("X_IF_TOO_LONG", "trim")  # "trim" corta / "skip" não posta
+X_ENDCARD = _get("X_ENDCARD", True)  # tela "veja no YouTube" nos posts cortados
+# Reply automático ao post com o link do YouTube ("" desativa)
+X_REPLY_TEMPLATE = _get("X_REPLY_TEMPLATE", "Veja o vídeo completo em {url}")
 X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 
 # Banner de abertura (thumbnail + título no topo da tela)
@@ -292,6 +295,104 @@ def prepare_bumper() -> None:
 
 # ------------------------- POST NO X ----------------------------------
 
+def make_endcard(video_id: str, out_ts: Path) -> bool:
+    """Tela final de 10s para posts cortados no X: fundo escuro, thumbnail,
+    'Veja o vídeo completo no YouTube' e o link escrito na imagem."""
+    thumb = VIDEO_DIR / f"{video_id}.jpg"
+    font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
+            if Path(INTRO_FONT).exists() else "")
+    cmd = ["ffmpeg", "-y", "-f", "lavfi",
+           "-i", f"color=c=0x111111:s={WIDTH}x{HEIGHT}:r={FPS}:d=10"]
+    if thumb.exists():
+        cmd += ["-loop", "1", "-t", "10", "-i", str(thumb)]
+        fc = ("[1:v]scale=1120:630[t];"
+              "[0:v][t]overlay=(W-w)/2:(H-h)/2+20[v1];")
+        base, a_idx = "[v1]", 2
+    else:
+        fc, base, a_idx = "", "[0:v]", 1
+    cmd += ["-f", "lavfi", "-t", "10", "-i", "anullsrc=r=44100:cl=stereo"]
+    fc += (f"{base}drawtext={font}text='Veja o vídeo completo no YouTube':"
+           f"fontsize=58:fontcolor=white:x=(w-text_w)/2:y=80[v2];"
+           f"[v2]drawtext={font}text='O link está no primeiro reply':"
+           f"fontsize=42:fontcolor=0xCCCCCC:x=(w-text_w)/2:y=165[v3];"
+           f"[v3]drawtext={font}text='youtu.be/{video_id}':fontsize=48:"
+           f"fontcolor=0x3EA6FF:x=(w-text_w)/2:y=h-150,format=yuv420p[vout]")
+    cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", f"{a_idx}:a",
+            "-c:v", "libx264", "-preset", X264_PRESET,
+            "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE,
+            "-bufsize", "9000k",
+            "-g", str(FPS * 2), "-keyint_min", str(FPS * 2),
+            "-sc_threshold", "0",
+            "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", "44100", "-ac", "2",
+            "-f", "mpegts", str(out_ts)]
+    r = run(cmd)
+    if r.returncode != 0 or not out_ts.exists():
+        log(f"AVISO: falha ao gerar a tela final "
+            f"({r.stderr.strip()[:200]}) — cortando sem aviso.")
+        return False
+    return True
+
+
+def build_x_mp4(video_id: str, limit: float):
+    """Monta o mp4 para o X. Se precisar cortar, os últimos 10s viram a tela
+    'Veja o vídeo completo no YouTube'. Retorna (mp4, duração) ou None."""
+    src = VIDEO_DIR / f"{video_id}.ts"
+    mp4 = TMP_DIR / f"{video_id}_x.mp4"
+    TMP_DIR.mkdir(exist_ok=True)
+    dur = video_duration(src) or 0
+    work, eff_dur, aux = src, dur, []
+
+    if limit and dur > limit:
+        log(f"X: {video_id} tem {dur:.0f}s — cortando para {limit:.0f}s.")
+        main = TMP_DIR / f"{video_id}_xmain.ts"
+        card = TMP_DIR / f"{video_id}_xcard.ts"
+        comb = TMP_DIR / f"{video_id}_xcomb.ts"
+        lst = TMP_DIR / f"{video_id}_xlist.txt"
+        aux = [main, card, comb, lst]
+        has_card = X_ENDCARD and make_endcard(video_id, card)
+        cut_t = max(limit - 10, 1) if has_card else limit
+        r = run(["ffmpeg", "-y", "-i", str(src), "-t", f"{cut_t:.3f}",
+                 "-c", "copy", str(main)])
+        if r.returncode != 0 or not main.exists():
+            log(f"ERRO ao cortar {video_id} para o X: "
+                f"{r.stderr.strip()[:200]}")
+            for f in aux:
+                f.unlink(missing_ok=True)
+            return None
+        work = main
+        if has_card:
+            lst.write_text(f"file '{main.as_posix()}'\n"
+                           f"file '{card.as_posix()}'\n", encoding="utf-8")
+            r = run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                     "-i", str(lst), "-c", "copy", str(comb)])
+            if r.returncode == 0 and comb.exists():
+                work = comb
+        eff_dur = limit
+
+    # cabe no teto de tamanho da API? senão, recomprime em 720p para caber
+    budget = X_TARGET_SIZE_MB * 1024 * 1024
+    cmd = ["ffmpeg", "-y", "-i", str(work)]
+    if work.stat().st_size <= budget:
+        cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
+    else:
+        v_kbps = max(400, int(budget * 8 / 1000 / eff_dur) - 128)
+        log(f"X: {video_id} é grande demais — recomprimindo em 720p @ "
+            f"{v_kbps}k para caber em {X_TARGET_SIZE_MB} MB "
+            "(leva alguns minutos).")
+        cmd += ["-vf", "scale=1280:720", "-c:v", "libx264",
+                "-preset", X264_PRESET, "-b:v", f"{v_kbps}k",
+                "-maxrate", f"{v_kbps}k", "-bufsize", f"{v_kbps * 2}k",
+                "-c:a", "aac", "-b:a", "128k"]
+    cmd += ["-movflags", "+faststart", str(mp4)]
+    r = run(cmd)
+    for f in aux:
+        f.unlink(missing_ok=True)
+    if r.returncode != 0 or not mp4.exists():
+        log(f"ERRO ao preparar mp4 para o X: {r.stderr.strip()[:300]}")
+        return None
+    return mp4, eff_dur
+
+
 def post_to_x(video_id: str, title: str) -> None:
     """Posta o vídeo processado no X. Falhas não interrompem o pipeline."""
     if not X_ENABLED:
@@ -304,43 +405,16 @@ def post_to_x(video_id: str, title: str) -> None:
         return
 
     src = VIDEO_DIR / f"{video_id}.ts"
-    mp4 = TMP_DIR / f"{video_id}_x.mp4"
-    TMP_DIR.mkdir(exist_ok=True)
-
     dur = video_duration(src) or 0
-    cmd = ["ffmpeg", "-y", "-i", str(src)]
-    eff_dur = dur
-    if dur > X_MAX_VIDEO_SECONDS:
-        if X_IF_TOO_LONG == "skip":
-            log(f"X: {video_id} tem {dur:.0f}s (limite {X_MAX_VIDEO_SECONDS}s) "
-                "— post pulado.")
-            return
-        log(f"X: {video_id} tem {dur:.0f}s — cortando para "
-            f"{X_MAX_VIDEO_SECONDS}s no post.")
-        cmd += ["-t", str(X_MAX_VIDEO_SECONDS)]
-        eff_dur = X_MAX_VIDEO_SECONDS
-
-    # cabe no teto de tamanho da API? senão, recomprime em 720p para caber
-    budget = X_TARGET_SIZE_MB * 1024 * 1024
-    est_size = src.stat().st_size * (eff_dur / dur if dur else 1)
-    if est_size <= budget:
-        cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
-    else:
-        v_kbps = max(400, int(budget * 8 / 1000 / eff_dur) - 128)
-        log(f"X: {video_id} é grande demais ({est_size/1e6:.0f} MB) — "
-            f"recomprimindo em 720p @ {v_kbps}k para caber em "
-            f"{X_TARGET_SIZE_MB} MB (leva alguns minutos).")
-        cmd += ["-vf", "scale=1280:720", "-c:v", "libx264",
-                "-preset", X264_PRESET, "-b:v", f"{v_kbps}k",
-                "-maxrate", f"{v_kbps}k", "-bufsize", f"{v_kbps * 2}k",
-                "-c:a", "aac", "-b:a", "128k"]
-    cmd += ["-movflags", "+faststart", str(mp4)]
-    r = run(cmd)
-    if r.returncode != 0 or not mp4.exists():
-        log(f"ERRO ao preparar mp4 para o X: {r.stderr.strip()[:300]}")
+    if dur > X_MAX_VIDEO_SECONDS and X_IF_TOO_LONG == "skip":
+        log(f"X: {video_id} tem {dur:.0f}s (limite {X_MAX_VIDEO_SECONDS}s) "
+            "— post pulado.")
         return
 
-    short = TMP_DIR / f"{video_id}_x140.mp4"
+    built = build_x_mp4(video_id, X_MAX_VIDEO_SECONDS)
+    if not built:
+        return
+    mp4, eff_dur = built
     try:
         auth = tweepy.OAuth1UserHandler(X_API_KEY, X_API_SECRET,
                                         X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
@@ -356,7 +430,16 @@ def post_to_x(video_id: str, title: str) -> None:
             log(f"X: enviando vídeo {video_id} ({category})...")
             media = api.media_upload(str(path), chunked=True,
                                      media_category=category)
-            client.create_tweet(text=text, media_ids=[media.media_id])
+            resp = client.create_tweet(text=text, media_ids=[media.media_id])
+            if X_REPLY_TEMPLATE:
+                reply = X_REPLY_TEMPLATE.format(
+                    title=title, url=f"https://youtu.be/{video_id}")[:280]
+                try:
+                    client.create_tweet(text=reply,
+                                        in_reply_to_tweet_id=resp.data["id"])
+                    log("X: reply com o link publicado.")
+                except Exception as e:
+                    log(f"AVISO: post ok, mas o reply com o link falhou: {e}")
 
         # vídeos >2min via API exigem a categoria amplify_video (mesmo Premium)
         category = "amplify_video" if eff_dur > 140 else "tweet_video"
@@ -366,22 +449,21 @@ def post_to_x(video_id: str, title: str) -> None:
         except Exception as e:
             m = re.search(r"longer than (\d+) minutes?", str(e))
             if category == "amplify_video" and m:
-                limit = int(m.group(1)) * 60 - 1  # 1s de margem
+                new_limit = int(m.group(1)) * 60 - 1  # 1s de margem
                 log(f"X: a conta aceita no máximo {m.group(1)} min via API — "
-                    f"postando os primeiros {limit}s como fallback.")
-                r = run(["ffmpeg", "-y", "-i", str(mp4), "-t", str(limit),
-                         "-c", "copy", "-movflags", "+faststart", str(short)])
-                if r.returncode != 0:
+                    f"reenviando cortado em {new_limit}s.")
+                built = build_x_mp4(video_id, new_limit)
+                if not built:
                     raise
-                send(short, "amplify_video" if limit > 140 else "tweet_video")
-                log(f"X: postado {video_id} (cortado em {limit}s).")
+                mp4, eff2 = built
+                send(mp4, "amplify_video" if eff2 > 140 else "tweet_video")
+                log(f"X: postado {video_id} (cortado em {new_limit}s).")
             else:
                 raise
     except Exception as e:
         log(f"ERRO ao postar no X ({video_id}): {e}")
     finally:
         mp4.unlink(missing_ok=True)
-        short.unlink(missing_ok=True)
 
 
 # ---------------------------- MONITOR ---------------------------------
@@ -455,8 +537,12 @@ def download_and_normalize(video_id: str):
                    thumb=thumb, title_txt=title_txt)
     raw.unlink(missing_ok=True)
     srt.unlink(missing_ok=True)
-    thumb.unlink(missing_ok=True)
     title_txt.unlink(missing_ok=True)
+    if ok and thumb.exists():
+        # guarda a thumbnail para a tela final dos posts cortados no X
+        shutil.move(str(thumb), str(VIDEO_DIR / f"{video_id}.jpg"))
+    else:
+        thumb.unlink(missing_ok=True)
     if ok:
         log(f"Pronto: {out_file.name}")
     return ok, title
@@ -495,8 +581,8 @@ def sync_playlist(ids_newest_first: list) -> None:
 
 
 def prune_old(keep_ids: list) -> None:
-    keep = {f"{i}.ts" for i in keep_ids}
-    for f in VIDEO_DIR.glob("*.ts"):
+    keep = {f"{i}.ts" for i in keep_ids} | {f"{i}.jpg" for i in keep_ids}
+    for f in list(VIDEO_DIR.glob("*.ts")) + list(VIDEO_DIR.glob("*.jpg")):
         if f.name not in keep:
             log(f"Removendo antigo: {f.name}")
             f.unlink(missing_ok=True)
