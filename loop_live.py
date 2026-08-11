@@ -106,6 +106,7 @@ X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 INTRO_BANNER = _get("INTRO_BANNER", True)
 INTRO_SECONDS = _get("INTRO_SECONDS", 30)
 INTRO_FONT = _get("INTRO_FONT", "C:/Windows/Fonts/arialbd.ttf")
+INTRO_LINE_HEIGHT = _get("INTRO_LINE_HEIGHT", 44)  # altura de linha do título
 
 # Lower third (sobreposto na transmissão — exige re-codificação contínua!)
 LOWER_THIRD = _get("LOWER_THIRD", False)
@@ -388,13 +389,15 @@ def generate_srt(video_path: Path, srt_path: Path) -> bool:
 # --------------------------- NORMALIZAÇÃO -----------------------------
 
 def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None,
-              thumb: Path = None, title_txt: Path = None) -> bool:
+              thumb: Path = None, title_lines: list = None) -> bool:
     """Converte src para o formato padrão .ts em dst.
 
     t_limit: duração máxima em segundos (corta o final).
     srt: arquivo .srt para queimar no vídeo.
-    thumb/title_txt: se presentes, desenha o banner de abertura (faixa no topo
-        com a thumbnail e o título) nos primeiros INTRO_SECONDS segundos.
+    thumb/title_lines: se presentes, desenha o banner de abertura (faixa no
+        topo com a thumbnail e o título — um arquivo de texto POR LINHA, com
+        posição vertical explícita: o espaçamento multilinha do drawtext
+        varia entre versões do FFmpeg) nos primeiros INTRO_SECONDS segundos.
     Todos os arquivos auxiliares devem estar na MESMA pasta de src — o ffmpeg
     roda com cwd nessa pasta para evitar problemas de escape de caminhos do
     Windows nos filtros.
@@ -410,23 +413,28 @@ def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None,
     cmd = ["ffmpeg", "-y", "-i", f"./{src.name}"]
 
     banner = (INTRO_BANNER and thumb is not None and thumb.exists()
-              and title_txt is not None and title_txt.exists())
+              and title_lines
+              and all(lf.exists() for lf in title_lines))
     if banner:
         bar_h, th_w, th_h, pad = 168, 214, 120, 24
+        lh = INTRO_LINE_HEIGHT
         show = f"enable='lt(t,{INTRO_SECONDS})'"
         font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
                 if Path(INTRO_FONT).exists() else "")
-        fc = (
-            f"[0:v]{base}[b0];"
-            f"[b0]drawbox=x=0:y=0:w=iw:h={bar_h}:color=black@0.55:"
-            f"t=fill:{show}[b1];"
-            f"[1:v]scale={th_w}:{th_h}[th];"
-            f"[b1][th]overlay=x={pad}:y={(bar_h - th_h) // 2}:{show}[b2];"
-            f"[b2]drawtext={font}textfile={title_txt.name}:fontsize=34:"
-            f"fontcolor=white:line_spacing=10:x={pad * 2 + th_w}:"
-            f"y=({bar_h}-th)/2:{show}[b3];"
-            f"[b3]{tail}format=yuv420p[vout]"
-        )
+        n = len(title_lines)
+        y0 = max(10, (bar_h - lh * n + (lh - 34)) // 2)
+        fc = (f"[0:v]{base}[b0];"
+              f"[b0]drawbox=x=0:y=0:w=iw:h={bar_h}:color=black@0.55:"
+              f"t=fill:{show}[b1];"
+              f"[1:v]scale={th_w}:{th_h}[th];"
+              f"[b1][th]overlay=x={pad}:y={(bar_h - th_h) // 2}:{show}[b2]")
+        cur = "b2"
+        for i, lf in enumerate(title_lines):
+            fc += (f";[{cur}]drawtext={font}textfile={lf.name}:fontsize=34:"
+                   f"fontcolor=white:x={pad * 2 + th_w}:"
+                   f"y={y0 + i * lh}:{show}[t{i}]")
+            cur = f"t{i}"
+        fc += f";[{cur}]{tail}format=yuv420p[vout]"
         cmd += ["-i", f"./{thumb.name}", "-filter_complex", fc,
                 "-map", "[vout]", "-map", "0:a?"]
     else:
@@ -797,12 +805,15 @@ def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None):
             log(f"AVISO: falha ao ler o título de {video_id}: {e}")
         info.unlink(missing_ok=True)
 
-    # banner de abertura: thumbnail (baixada acima) + título em arquivo
+    # banner de abertura: thumbnail (baixada acima) + título, um arquivo
+    # por linha (posicionamento vertical manual no filtro)
     thumb = TMP_DIR / f"{video_id}.jpg"
-    title_txt = TMP_DIR / f"{video_id}.txt"
+    title_lines = []
     if INTRO_BANNER and title:
-        wrapped = textwrap.wrap(title, width=80)[:3]
-        title_txt.write_text("\n".join(wrapped), encoding="utf-8")
+        for i, ln in enumerate(textwrap.wrap(title, width=80)[:3]):
+            lf = TMP_DIR / f"{video_id}.t{i}.txt"
+            lf.write_text(ln, encoding="utf-8")
+            title_lines.append(lf)
 
     # corte dos segundos finais
     t_limit = None
@@ -826,10 +837,11 @@ def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None):
 
     log(f"Normalizando {video_id}...")
     ok = normalize(raw, out_file, t_limit=t_limit, srt=srt_ok,
-                   thumb=thumb, title_txt=title_txt)
+                   thumb=thumb, title_lines=title_lines)
     raw.unlink(missing_ok=True)
     srt.unlink(missing_ok=True)
-    title_txt.unlink(missing_ok=True)
+    for lf in title_lines:
+        safe_unlink(lf)
     if ok and thumb.exists():
         # guarda a thumbnail para a tela final dos posts cortados no X
         shutil.move(str(thumb), str(out_dir / f"{video_id}.jpg"))
