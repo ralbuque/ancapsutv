@@ -140,6 +140,10 @@ AGORA_LEAD_SPACES = _get("AGORA_LEAD_SPACES", 64)
 AGORA_LIFT = _get("AGORA_LIFT", 76)  # altura da barra AGORA (maior = mais alta)
 AGORA_BOX = _get("AGORA_BOX", "0xD9D9D9")       # barra cinza clara
 AGORA_TEXTCOL = _get("AGORA_TEXTCOL", "0x1F1F1F")
+# o espectador vê a live com atraso; o AGORA desconta esse atraso para trocar
+# junto com o que aparece na tela (ajuste fino: aumente se o AGORA "adianta")
+AGORA_DELAY = _get("AGORA_DELAY", 20)
+RESTART_COOLDOWN = _get("RESTART_COOLDOWN", 90)  # seg. mínimos entre reinícios
 
 # Relógio (escrito pelo script já convertido para o fuso configurado)
 LT_CLOCK = _get("LT_CLOCK", True)
@@ -532,9 +536,10 @@ def detect_guests() -> None:
                 log(f"Vídeo novo em {name}: {vid} — na fila de processamento.")
                 enqueue_job("guest", vid, cfg=g, prio=0)
             else:
-                # atual pronto: pode limpar os anteriores
+                # atual pronto: limpa anteriores (nunca os ainda na playlist)
+                refs = _referenced_files()
                 for f in list(gdir.glob("*.ts")) + list(gdir.glob("*.jpg")):
-                    if f.stem != vid:
+                    if f.stem != vid and f.name not in refs:
                         log(f"Removendo antigo de {name}: {f.name}")
                         safe_unlink(f)
         except Exception as e:
@@ -858,7 +863,7 @@ def detect_shorts() -> None:
         t = fetch_title(sid)
         if t:
             save_short_title(sid, t)
-    keep = {f"{i}.ts" for i in ids}
+    keep = {f"{i}.ts" for i in ids} | _referenced_files()
     for f in SHORTS_DIR.glob("*.ts"):
         if f.name not in keep:
             log(f"Removendo short antigo: {f.name}")
@@ -1079,12 +1084,28 @@ def _sync_playlist_inner(ids_newest_first: list) -> None:
             SCHEDULE_FILE.write_text(sched_json, encoding="utf-8")
 
 
+def _referenced_files() -> set:
+    """Nomes de arquivos que a playlist ativa ou a pendente ainda usam —
+    apagar um desses derruba a transmissão."""
+    refs = set()
+    for pl in (PLAYLIST, PLAYLIST_PENDING):
+        try:
+            for l in pl.read_text(encoding="utf-8").splitlines():
+                m = re.match(r"file '(.+)'", l.strip())
+                if m:
+                    refs.add(Path(m.group(1)).name)
+        except OSError:
+            pass
+    return refs
+
+
 def prune_old(keep_ids: list) -> None:
-    keep = {f"{i}.ts" for i in keep_ids} | {f"{i}.jpg" for i in keep_ids}
+    keep = ({f"{i}.ts" for i in keep_ids} | {f"{i}.jpg" for i in keep_ids}
+            | _referenced_files())
     for f in list(VIDEO_DIR.glob("*.ts")) + list(VIDEO_DIR.glob("*.jpg")):
         if f.name not in keep:
             log(f"Removendo antigo: {f.name}")
-            f.unlink(missing_ok=True)
+            safe_unlink(f)  # se estiver em uso, tenta no próximo ciclo
 
 
 def watcher() -> None:
@@ -1190,11 +1211,27 @@ def get_duration_cached(p: Path) -> float:
         mt = p.stat().st_mtime
     except OSError:
         return 0.0
-    key = f"{p.parent.name}/{p.name}"
+    key = f"v2:{p.parent.name}/{p.name}"
     ent = _dur_cache.get(key)
     if ent and abs(ent[0] - mt) < 1:
         return ent[1]
-    d = video_duration(p) or 0.0
+    # duração frame-exata (conta pacotes de vídeo; nossos .ts são CFR):
+    # a estimativa do ffprobe erra frações de segundo que acumulam no ciclo
+    d = None
+    if p.suffix == ".ts":
+        r = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-count_packets", "-show_entries", "stream=nb_read_packets",
+                 "-of", "csv=p=0", str(p)])
+        try:
+            # mpegts pode listar o stream duas vezes (program + stream)
+            first = next((l for l in r.stdout.splitlines() if l.strip()), "")
+            n = int(first.strip())
+            if n > 0:
+                d = n / FPS
+        except ValueError:
+            pass
+    if d is None:
+        d = video_duration(p) or 0.0
     _dur_cache[key] = [mt, d]
     try:
         DURATIONS_FILE.write_text(json.dumps(_dur_cache), encoding="utf-8")
@@ -1286,7 +1323,8 @@ def current_entry(now: float = None):
     if not sched or not sched.get("total") or not _play["at"]:
         return None
     now = now or time.time()
-    pos = (_play["pos"] + min(now - _play["at"], 5.0)) % sched["total"]
+    pos = (_play["pos"] + min(now - _play["at"], 5.0)
+           - AGORA_DELAY) % sched["total"]
     for e in sched.get("entries", []):
         pos -= e.get("d", 0)
         if pos < 0:
@@ -1308,6 +1346,21 @@ def save_resume() -> None:
                                    encoding="utf-8")
         except OSError:
             pass
+
+
+def _mark_resume_playlist_head() -> None:
+    """No fim natural do ciclo, a continuação correta é o TOPO da playlist
+    atual (que pode estar rotacionada) — não o último item tocado."""
+    try:
+        first = next((l for l in
+                      PLAYLIST.read_text(encoding="utf-8").splitlines()
+                      if l.strip()), "")
+        m = re.match(r"file '(.+)'", first)
+        if m:
+            RESUME_FILE.write_text(json.dumps({"file": m.group(1)}),
+                                   encoding="utf-8")
+    except Exception:
+        pass
 
 
 def rotate_for_resume() -> None:
@@ -1483,9 +1536,11 @@ def streamer() -> None:
             continue
 
         restart_event.clear()
+        # sem -stream_loop: cada volta completa termina e recomeça, o que
+        # ressincroniza a posição do AGORA (durações estimadas acumulam erro)
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-re", "-stream_loop", "-1",
+            "-re",
             "-f", "concat", "-safe", "0", "-i", str(PLAYLIST),
         ]
         if LOWER_THIRD:
@@ -1527,19 +1582,28 @@ def streamer() -> None:
         threading.Thread(target=_progress_reader, args=(proc,),
                          daemon=True, name="progress").start()
 
-        # espera o processo cair ou a playlist mudar
-        while proc.poll() is None and not restart_event.is_set():
+        # espera o fim do ciclo, uma queda, ou a playlist mudar (com um
+        # intervalo mínimo entre reinícios voluntários, para não encadear)
+        started = time.time()
+        while proc.poll() is None:
+            if (restart_event.is_set()
+                    and time.time() - started >= RESTART_COOLDOWN):
+                break
             time.sleep(2)
 
-        save_resume()  # guarda o item no ar para retomar dali
         if proc.poll() is None:
+            save_resume()  # guarda o item no ar para retomar dali
             log("Reiniciando FFmpeg com a playlist nova...")
             proc.terminate()
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        elif proc.returncode == 0:
+            log("Ciclo completo — recomeçando a fila.")
+            _mark_resume_playlist_head()
         else:
+            save_resume()
             log(f"FFmpeg caiu (código {proc.returncode}). Reiniciando em 5s...")
             time.sleep(5)
 
