@@ -63,7 +63,7 @@ WHISPER_MODEL = _get("WHISPER_MODEL", "small")
 SUBTITLE_STYLE = _get("SUBTITLE_STYLE",
                       "FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,"
                       "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
-                      "Shadow=0,MarginV=30")
+                      "Shadow=0,MarginV=60")  # 60 ≈ 225px do rodapé em 1080p
 WIDTH = _get("WIDTH", 1920)
 HEIGHT = _get("HEIGHT", 1080)
 FPS = _get("FPS", 30)
@@ -779,6 +779,17 @@ def watcher() -> None:
             ids = latest_video_ids()
             if ids:
                 new = [i for i in ids if not (VIDEO_DIR / f"{i}.ts").exists()]
+                # aviso imediato no ticker: o vídeo JÁ está no canal, mesmo
+                # que o processamento (legendas etc.) ainda vá demorar
+                prev_known = _load_titles().get("order", [])
+                for vid in new:
+                    if prev_known and vid not in prev_known:
+                        t = fetch_title(vid)
+                        if t:
+                            save_title(vid, t)
+                            set_alert(t)
+                            log(f"Vídeo novo no canal — aviso no ticker: {t[:60]}")
+                update_titles_order(ids)
                 for k, vid in enumerate(new):
                     if k > 0:
                         time.sleep(DOWNLOAD_PAUSE)  # não martelar o YouTube
@@ -788,7 +799,6 @@ def watcher() -> None:
                         save_title(vid, title or "")
                         sync_playlist(ids)
                         log(f"{vid} entrou no loop.")
-                        set_alert(title or "")
                         post_to_x(vid, title or "")
                 prune_old(ids)
                 backfill_titles(ids)
@@ -836,6 +846,23 @@ def save_title(video_id: str, title: str) -> None:
     _save_titles(data)
 
 
+def fetch_title(vid: str) -> str:
+    """Busca só o título de um vídeo (sem baixar), sempre em UTF-8."""
+    TMP_DIR.mkdir(exist_ok=True)
+    out = TMP_DIR / f"t_{vid}.info.json"
+    run(ytdlp_cmd() + ["--skip-download", "--write-info-json",
+                       "-o", str(TMP_DIR / f"t_{vid}"),
+                       f"https://www.youtube.com/watch?v={vid}"])
+    if out.exists():
+        try:
+            return json.loads(out.read_text(encoding="utf-8")).get("title", "")
+        except Exception:
+            return ""
+        finally:
+            safe_unlink(out)
+    return ""
+
+
 def backfill_titles(ids: list) -> None:
     """Busca (sem re-baixar) os títulos de vídeos processados antes do ticker
     existir, para a barra não ficar vazia."""
@@ -845,20 +872,10 @@ def backfill_titles(ids: list) -> None:
     missing = [i for i in ids if i not in data.get("titles", {})
                and (VIDEO_DIR / f"{i}.ts").exists()]
     for vid in missing[:5]:  # poucos por ciclo, para não pesar
-        TMP_DIR.mkdir(exist_ok=True)
-        out = TMP_DIR / f"t_{vid}.info.json"
-        run(ytdlp_cmd() + ["--skip-download", "--write-info-json",
-                           "-o", str(TMP_DIR / f"t_{vid}"),
-                           f"https://www.youtube.com/watch?v={vid}"])
-        if out.exists():
-            try:
-                t = json.loads(out.read_text(encoding="utf-8")).get("title", "")
-                if t:
-                    save_title(vid, t)
-                    log(f"Título recuperado para o ticker: {t[:60]}")
-            except Exception:
-                pass
-            safe_unlink(out)
+        t = fetch_title(vid)
+        if t:
+            save_title(vid, t)
+            log(f"Título recuperado para o ticker: {t[:60]}")
 
 
 def update_titles_order(ids_newest_first: list) -> None:

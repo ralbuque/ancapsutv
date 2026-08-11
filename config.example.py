@@ -21,7 +21,7 @@ BURN_SUBTITLES = True    # legendas queimadas no vídeo
 WHISPER_MODEL = "small"  # "base" (rápido) / "small" (recomendado) / "medium" (lento)
 SUBTITLE_STYLE = ("FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,"
                   "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
-                  "Shadow=0,MarginV=30")
+                  "Shadow=0,MarginV=60")  # 60 ≈ 225px do rodapé (folga p/ lower third)
 
 # Formato de saída
 WIDTH, HEIGHT = 1920, 1080
