@@ -47,7 +47,7 @@ TICKER_SECONDS = 8    # segundos que cada título fica na tela
 ALERT_MINUTES = 10    # duração do aviso de vídeo novo
 LOWER_THIRD_BADGE = "badge.png"  # PNG transparente com o emblema (nome+canal);
                                  # se existir, substitui os textos da esquerda
-TICKER_X = 430                   # onde a barra começa (depois do emblema)
+TICKER_LEAD_SPACES = 56          # espaços antes do texto (para sair do emblema)
 ALERT_PREFIX = "LANÇADO: "       # prefixo do aviso de vídeo novo
 TICKER_BOX = "0xF2B705"          # cor da barra normal (dourada)
 ALERT_BOX = "0xEF7B6D"           # cor da barra de alerta (salmão)

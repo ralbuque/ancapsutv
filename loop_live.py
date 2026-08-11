@@ -110,7 +110,9 @@ ALERT_MINUTES = _get("ALERT_MINUTES", 10)   # duração do aviso de vídeo novo
 # Arte: PNG transparente com o emblema (nome+canal); se existir, substitui
 # os textos da esquerda e as barras começam depois dele
 LOWER_THIRD_BADGE = _get("LOWER_THIRD_BADGE", "badge.png")
-TICKER_X = _get("TICKER_X", 430)            # onde a barra de títulos começa
+# A barra atravessa a tela inteira (por trás do emblema); os espaços iniciais
+# empurram o texto para depois do emblema — ajuste fino se o PNG mudar de largura
+TICKER_LEAD_SPACES = _get("TICKER_LEAD_SPACES", 56)
 TICKER_PREFIX = _get("TICKER_PREFIX", "")
 ALERT_PREFIX = _get("ALERT_PREFIX", "LANÇADO: ")
 TICKER_BOX = _get("TICKER_BOX", "0xF2B705")     # barra dourada
@@ -879,16 +881,18 @@ def ticker_thread() -> None:
             now = time.time()
             with _alert_lock:
                 a_text, a_until = _alert["text"], _alert["until"]
+            # espaços iniciais posicionam o texto depois do emblema; o ljust
+            # alonga a barra até (além de) a borda direita da tela
+            lead = " " * TICKER_LEAD_SPACES
             if a_text and now < a_until:
-                # o padding alonga a barra até a borda direita da tela
-                t_text, al = "", f"{ALERT_PREFIX}{a_text}".ljust(220)
+                t_text, al = "", f"{lead}{ALERT_PREFIX}{a_text}".ljust(340)
             else:
                 data = _load_titles()
                 titles = [data["titles"][i] for i in data.get("order", [])
                           if i in data.get("titles", {})][:TICKER_COUNT]
                 if titles:
                     idx = int(now // TICKER_SECONDS) % len(titles)
-                    t_text = f"{TICKER_PREFIX}{titles[idx]}".ljust(220)
+                    t_text = f"{lead}{TICKER_PREFIX}{titles[idx]}".ljust(340)
                 else:
                     t_text = ""
                 al = ""
@@ -909,7 +913,9 @@ def lower_third_filter(include_identity: bool = True) -> str:
     include_identity=False quando o emblema (badge.png) cobre nome/canal."""
     font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
             if Path(INTRO_FONT).exists() else "")
-    offx = f"x=if(gt(text_w\\,2)\\,{TICKER_X}\\,w+50)"
+    # visível: barra colada na borda esquerda (o texto começa depois do emblema
+    # via espaços) e no rodapé (y=h-th-16); vazio: fora da tela
+    offx = "x=if(gt(text_w\\,2)\\,0\\,w+50)"
     parts = []
     if include_identity:
         name = LOWER_THIRD_NAME.replace("'", "").replace(":", "\\:")
@@ -922,10 +928,10 @@ def lower_third_filter(include_identity: bool = True) -> str:
         ]
     parts += [
         f"drawtext={font}textfile=ticker.txt:reload=1:expansion=none:"
-        f"fontsize=28:fontcolor={TICKER_TEXTCOL}:{offx}:y=h-68:"
+        f"fontsize=28:fontcolor={TICKER_TEXTCOL}:{offx}:y=h-th-16:"
         f"box=1:boxcolor={TICKER_BOX}:boxborderw=16",
         f"drawtext={font}textfile=alert.txt:reload=1:expansion=none:"
-        f"fontsize=28:fontcolor={ALERT_TEXTCOL}:{offx}:y=h-68:"
+        f"fontsize=28:fontcolor={ALERT_TEXTCOL}:{offx}:y=h-th-16:"
         f"box=1:boxcolor={ALERT_BOX}:boxborderw=16",
     ]
     return ",".join(parts)
@@ -967,7 +973,7 @@ def streamer() -> None:
             if badge.exists():
                 # barras via drawtext + emblema PNG sobreposto por cima
                 fc = (f"[0:v]{lower_third_filter(include_identity=False)}[v0];"
-                      f"[v0][1:v]overlay=24:main_h-overlay_h-26[vout]")
+                      f"[v0][1:v]overlay=0:main_h-overlay_h[vout]")
                 cmd += ["-loop", "1", "-i", badge.name,
                         "-filter_complex", fc,
                         "-map", "[vout]", "-map", "0:a"]
