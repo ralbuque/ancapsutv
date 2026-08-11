@@ -290,8 +290,9 @@ def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None,
     tail = (f"subtitles={srt.name}:force_style='{SUBTITLE_STYLE}',"
             if srt is not None else "")
 
+    # "./" evita que nomes começando com "-" (IDs do YouTube) virem opções
     tmp_out = workdir / (dst.stem + ".part.ts")
-    cmd = ["ffmpeg", "-y", "-i", src.name]
+    cmd = ["ffmpeg", "-y", "-i", f"./{src.name}"]
 
     banner = (INTRO_BANNER and thumb is not None and thumb.exists()
               and title_txt is not None and title_txt.exists())
@@ -311,14 +312,14 @@ def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None,
             f"y=({bar_h}-th)/2:{show}[b3];"
             f"[b3]{tail}format=yuv420p[vout]"
         )
-        cmd += ["-i", thumb.name, "-filter_complex", fc,
+        cmd += ["-i", f"./{thumb.name}", "-filter_complex", fc,
                 "-map", "[vout]", "-map", "0:a?"]
     else:
         cmd += ["-vf", f"{base},{tail}format=yuv420p"]
 
     if t_limit is not None:
         cmd += ["-t", f"{t_limit:.3f}"]
-    cmd += _encode_args() + [tmp_out.name]
+    cmd += _encode_args() + [f"./{tmp_out.name}"]
     r = run(cmd, cwd=str(workdir))
     if r.returncode != 0 or not tmp_out.exists():
         log(f"ERRO na normalização de {src.name}: {r.stderr.strip()[-400:]}")
@@ -338,9 +339,9 @@ def normalize_short(src: Path, dst: Path) -> bool:
           f"crop={WIDTH}:{HEIGHT},boxblur=20:5[bg];"
           f"[b]scale=-2:{HEIGHT}[fg];"
           f"[bg][fg]overlay=(W-w)/2:(H-h)/2,fps={FPS},format=yuv420p[vout]")
-    cmd = (["ffmpeg", "-y", "-i", src.name, "-filter_complex", fc,
+    cmd = (["ffmpeg", "-y", "-i", f"./{src.name}", "-filter_complex", fc,
             "-map", "[vout]", "-map", "0:a?"]
-           + _encode_args() + [tmp_out.name])
+           + _encode_args() + [f"./{tmp_out.name}"])
     r = run(cmd, cwd=str(workdir))
     if r.returncode != 0 or not tmp_out.exists():
         log(f"ERRO na normalização do short {src.name}: "
