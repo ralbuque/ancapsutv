@@ -166,6 +166,18 @@ def ytdlp_cmd() -> list:
 
 restart_event = threading.Event()   # avisa o streamer que a playlist mudou
 _whisper_model = None
+_stream_proc = None                 # ffmpeg da transmissão em execução
+
+
+def kill_stream() -> None:
+    """Encerra o ffmpeg da transmissão (para ele não sobreviver ao script)."""
+    p = _stream_proc
+    if p is not None and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
 
 
 def log(msg: str) -> None:
@@ -989,7 +1001,9 @@ def streamer() -> None:
             cmd += ["-c", "copy"]
             log("Iniciando transmissão...")
         cmd += ["-bsf:a", "aac_adtstoasc", "-f", "flv", RTMP_URL]
+        global _stream_proc
         proc = subprocess.Popen(cmd, cwd=str(BASE_DIR))
+        _stream_proc = proc
 
         # espera o processo cair ou a playlist mudar
         while proc.poll() is None and not restart_event.is_set():
@@ -1056,6 +1070,8 @@ def main() -> None:
         streamer()
     except KeyboardInterrupt:
         log("Encerrado pelo usuário.")
+    finally:
+        kill_stream()
 
 
 if __name__ == "__main__":
