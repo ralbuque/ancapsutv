@@ -1139,14 +1139,17 @@ def update_titles_order(ids_newest_first: list) -> None:
 
 
 def _write_text_file(path: Path, text: str) -> None:
-    """Escrita DIRETA, sem renomeio: o drawtext reabre o arquivo a cada frame
-    e a troca por rename no Windows bloqueia a leitura por um instante,
-    derrubando o FFmpeg. No pior caso da escrita direta, um único frame
-    mostra texto parcial — imperceptível."""
+    """Escrita segura para arquivos que o drawtext mapeia a cada frame:
+    - sem renomeio (trava a leitura no Windows -> FFmpeg cai);
+    - sem truncar para zero (CreateFileMapping falha com arquivo vazio);
+    - 'vazio' vira uma quebra de linha: 1 byte, nenhum glifo, barra some.
+    Pior caso: um único frame com texto misturado — imperceptível."""
+    data = (text if text else "\n").encode("utf-8")
     for _ in range(5):
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
+            with open(path, "r+b" if path.exists() else "wb") as f:
+                f.write(data)
+                f.truncate(len(data))
             return
         except OSError:
             time.sleep(0.05)
@@ -1424,11 +1427,12 @@ def main() -> None:
     log(f"Corte final: {CUT_END_SECONDS}s | Legendas: "
         f"{'ativadas (' + WHISPER_MODEL + ')' if BURN_SUBTITLES else 'desativadas'}")
     if LOWER_THIRD:
-        # os arquivos precisam existir antes do primeiro ffmpeg com drawtext
+        # os arquivos precisam existir E ter ao menos 1 byte antes do primeiro
+        # ffmpeg com drawtext (arquivo de 0 bytes falha no CreateFileMapping)
         for f in (TICKER_FILE, ALERT_FILE, AGORA_FILE,
                   CLOCK_DATE_FILE, CLOCK_TIME_FILE):
-            if not f.exists():
-                f.write_text("", encoding="utf-8")
+            if not f.exists() or f.stat().st_size == 0:
+                f.write_text("\n", encoding="utf-8")
         threading.Thread(target=ticker_thread, daemon=True,
                          name="ticker").start()
     threading.Thread(target=watcher, daemon=True, name="watcher").start()
