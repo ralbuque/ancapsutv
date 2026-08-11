@@ -73,6 +73,32 @@ PROMO_OUTRO_NAME = "continuidade.mp4"   # "Continue agora com a TV ANCAPSU"
 PROMO_MAX_SHORTS = 10  # rodízio com os N shorts mais recentes
 PROMO_EVERY = 2        # 2 = alterna vinheta/promo; 3 = promo a cada 3 intervalos
 
+# --- Canais convidados (1 vídeo de cada no ciclo, em posição fixa) ---
+# Coloque as vinhetas .mp4 de cada canal na pasta do script.
+GUEST_CHANNELS = [
+    # {
+    #     "name": "Mundo em Revolução",
+    #     "url": "https://www.youtube.com/@canal/videos",  # aba /videos
+    #     "position": 10,               # posição no ciclo (1-based)
+    #     "intro": "mundo_intro.mp4",   # vinheta apresentando o canal
+    #     "outro": "mundo_outro.mp4",   # vinheta de volta à programação
+    #     "x_api_key": "",              # credenciais da conta X DESSE canal
+    #     "x_api_secret": "",
+    #     "x_access_token": "",
+    #     "x_access_token_secret": "",
+    #     # "cut_end": 10,  # segundos cortados do final (0 = não cortar)
+    # },
+    # {
+    #     "name": "Safesrc",
+    #     "url": "https://www.youtube.com/@canal2/videos",
+    #     "position": 16,
+    #     "intro": "safesrc_intro.mp4",
+    #     "outro": "safesrc_outro.mp4",
+    #     "x_api_key": "", "x_api_secret": "",
+    #     "x_access_token": "", "x_access_token_secret": "",
+    # },
+]
+
 # --- Publicação automática no X (ex-Twitter) ---
 # Credenciais em developer.x.com (app com permissão Read and Write, OAuth 1.0a)
 X_ENABLED = False

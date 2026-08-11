@@ -93,6 +93,11 @@ PROMO_INTRO_NAME = _get("PROMO_INTRO_NAME", "chamada.mp4")
 PROMO_OUTRO_NAME = _get("PROMO_OUTRO_NAME", "continuidade.mp4")
 PROMO_MAX_SHORTS = _get("PROMO_MAX_SHORTS", 10)  # tamanho do rodízio de shorts
 PROMO_EVERY = _get("PROMO_EVERY", 2)  # 2 = alterna vinheta/promo nos intervalos
+
+# Canais convidados: o vídeo mais recente de cada um entra no ciclo numa
+# posição fixa, com vinhetas próprias de entrada/saída e X em conta separada.
+# Lista de dicts — veja config.example.py para o formato.
+GUEST_CHANNELS = _get("GUEST_CHANNELS", [])
 X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 
 # Banner de abertura (thumbnail + título no topo da tela)
@@ -154,6 +159,12 @@ PLAYLIST_PENDING = BASE_DIR / "playlist_new.txt"
 BUMPER_SOURCE = BASE_DIR / BUMPER_SOURCE_NAME
 BUMPER_TS = BASE_DIR / "bumper.ts"
 SHORTS_DIR = BASE_DIR / "shorts"
+GUESTS_DIR = BASE_DIR / "guests"
+
+
+def _slug(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
+    return s or "canal"
 PROMO_INTRO_SRC = BASE_DIR / PROMO_INTRO_NAME
 PROMO_OUTRO_SRC = BASE_DIR / PROMO_OUTRO_NAME
 PROMO_INTRO_TS = BASE_DIR / "chamada.ts"
@@ -453,14 +464,73 @@ def prepare_bumper() -> None:
                        "a chamada do outro canal")
         prepare_static(PROMO_OUTRO_SRC, PROMO_OUTRO_TS,
                        "a vinheta de continuidade")
+    for g in GUEST_CHANNELS:
+        slug = _slug(g.get("name", ""))
+        if g.get("intro"):
+            prepare_static(BASE_DIR / g["intro"],
+                           BASE_DIR / f"{slug}_intro.ts",
+                           f"a vinheta de entrada de {g.get('name')}")
+        if g.get("outro"):
+            prepare_static(BASE_DIR / g["outro"],
+                           BASE_DIR / f"{slug}_outro.ts",
+                           f"a vinheta de saída de {g.get('name')}")
+
+
+def sync_guests() -> None:
+    """Baixa o vídeo mais recente de cada canal convidado, processa igual aos
+    do canal principal e posta no X com as credenciais do canal."""
+    for g in GUEST_CHANNELS:
+        try:
+            name = g.get("name", "?")
+            url = g.get("url", "")
+            if not url:
+                continue
+            slug = _slug(name)
+            gdir = GUESTS_DIR / slug
+            gdir.mkdir(parents=True, exist_ok=True)
+            r = run(ytdlp_cmd() + ["--flat-playlist", "--playlist-end", "1",
+                                   "--print", "%(id)s", url])
+            if r.returncode != 0:
+                log(f"ERRO ao consultar {name}: {r.stderr.strip()[-200:]}")
+                continue
+            ids = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+            if not ids:
+                continue
+            vid = ids[0]
+            if not (gdir / f"{vid}.ts").exists():
+                log(f"Vídeo novo em {name}: {vid}")
+                ok, title = download_and_normalize(
+                    vid, out_dir=gdir, cut_end=g.get("cut_end"))
+                if ok:
+                    data = _load_titles()
+                    data.setdefault("guests", {})[slug] = {
+                        "id": vid, "title": title or ""}
+                    _save_titles(data)
+                    log(f"{name}: pronto para o ciclo.")
+                    ck = [g.get("x_api_key"), g.get("x_api_secret"),
+                          g.get("x_access_token"),
+                          g.get("x_access_token_secret")]
+                    if all(ck):
+                        post_to_x(vid, title or "", src_dir=gdir,
+                                  creds={"api_key": ck[0],
+                                         "api_secret": ck[1],
+                                         "access_token": ck[2],
+                                         "access_token_secret": ck[3]})
+            # só o vídeo atual fica no disco
+            for f in list(gdir.glob("*.ts")) + list(gdir.glob("*.jpg")):
+                if f.stem != vid:
+                    log(f"Removendo antigo de {name}: {f.name}")
+                    safe_unlink(f)
+        except Exception as e:
+            log(f"ERRO no canal convidado {g.get('name', '?')}: {e}")
 
 
 # ------------------------- POST NO X ----------------------------------
 
-def make_endcard(video_id: str, out_ts: Path) -> bool:
+def make_endcard(video_id: str, out_ts: Path, thumb_dir: Path = None) -> bool:
     """Tela final de 10s para posts cortados no X: fundo escuro, thumbnail,
     'Veja o vídeo completo no YouTube' e o link escrito na imagem."""
-    thumb = VIDEO_DIR / f"{video_id}.jpg"
+    thumb = (thumb_dir or VIDEO_DIR) / f"{video_id}.jpg"
     font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
             if Path(INTRO_FONT).exists() else "")
     cmd = ["ffmpeg", "-y", "-f", "lavfi",
@@ -495,10 +565,11 @@ def make_endcard(video_id: str, out_ts: Path) -> bool:
     return True
 
 
-def build_x_mp4(video_id: str, limit: float):
+def build_x_mp4(video_id: str, limit: float, src_dir: Path = None):
     """Monta o mp4 para o X. Se precisar cortar, os últimos 10s viram a tela
     'Veja o vídeo completo no YouTube'. Retorna (mp4, duração) ou None."""
-    src = VIDEO_DIR / f"{video_id}.ts"
+    src_dir = src_dir or VIDEO_DIR
+    src = src_dir / f"{video_id}.ts"
     mp4 = TMP_DIR / f"{video_id}_x.mp4"
     TMP_DIR.mkdir(exist_ok=True)
     dur = video_duration(src) or 0
@@ -511,7 +582,8 @@ def build_x_mp4(video_id: str, limit: float):
         comb = TMP_DIR / f"{video_id}_xcomb.ts"
         lst = TMP_DIR / f"{video_id}_xlist.txt"
         aux = [main, card, comb, lst]
-        has_card = X_ENDCARD and make_endcard(video_id, card)
+        has_card = X_ENDCARD and make_endcard(video_id, card,
+                                              thumb_dir=src_dir)
         cut_t = max(limit - 10, 1) if has_card else limit
         r = run(["ffmpeg", "-y", "-i", str(src), "-t", f"{cut_t:.3f}",
                  "-c", "copy", str(main)])
@@ -555,10 +627,16 @@ def build_x_mp4(video_id: str, limit: float):
     return mp4, eff_dur
 
 
-def post_to_x(video_id: str, title: str) -> None:
-    """Posta o vídeo processado no X. Falhas não interrompem o pipeline."""
-    if not X_ENABLED:
-        return
+def post_to_x(video_id: str, title: str, src_dir: Path = None,
+              creds: dict = None) -> None:
+    """Posta o vídeo processado no X. Falhas não interrompem o pipeline.
+    creds permite postar em outra conta (canais convidados)."""
+    if creds is None:
+        if not X_ENABLED:
+            return
+        creds = {"api_key": X_API_KEY, "api_secret": X_API_SECRET,
+                 "access_token": X_ACCESS_TOKEN,
+                 "access_token_secret": X_ACCESS_TOKEN_SECRET}
     try:
         import tweepy
     except ImportError:
@@ -566,25 +644,27 @@ def post_to_x(video_id: str, title: str) -> None:
             "post no X pulado.")
         return
 
-    src = VIDEO_DIR / f"{video_id}.ts"
+    src_dir = src_dir or VIDEO_DIR
+    src = src_dir / f"{video_id}.ts"
     dur = video_duration(src) or 0
     if dur > X_MAX_VIDEO_SECONDS and X_IF_TOO_LONG == "skip":
         log(f"X: {video_id} tem {dur:.0f}s (limite {X_MAX_VIDEO_SECONDS}s) "
             "— post pulado.")
         return
 
-    built = build_x_mp4(video_id, X_MAX_VIDEO_SECONDS)
+    built = build_x_mp4(video_id, X_MAX_VIDEO_SECONDS, src_dir=src_dir)
     if not built:
         return
     mp4, eff_dur = built
     try:
-        auth = tweepy.OAuth1UserHandler(X_API_KEY, X_API_SECRET,
-                                        X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
+        auth = tweepy.OAuth1UserHandler(
+            creds["api_key"], creds["api_secret"],
+            creds["access_token"], creds["access_token_secret"])
         api = tweepy.API(auth)
         client = tweepy.Client(
-            consumer_key=X_API_KEY, consumer_secret=X_API_SECRET,
-            access_token=X_ACCESS_TOKEN,
-            access_token_secret=X_ACCESS_TOKEN_SECRET)
+            consumer_key=creds["api_key"], consumer_secret=creds["api_secret"],
+            access_token=creds["access_token"],
+            access_token_secret=creds["access_token_secret"])
         text = X_TEXT_TEMPLATE.format(
             title=title, url=f"https://youtu.be/{video_id}")[:280]
 
@@ -630,7 +710,7 @@ def post_to_x(video_id: str, title: str) -> None:
                 new_limit = int(m.group(1)) * 60 - 1  # 1s de margem
                 log(f"X: a conta aceita no máximo {m.group(1)} min via API — "
                     f"reenviando cortado em {new_limit}s.")
-                built = build_x_mp4(video_id, new_limit)
+                built = build_x_mp4(video_id, new_limit, src_dir=src_dir)
                 if not built:
                     raise
                 mp4, eff2 = built
@@ -659,10 +739,12 @@ def latest_video_ids() -> list:
     return [l.strip() for l in r.stdout.splitlines() if l.strip()]
 
 
-def download_and_normalize(video_id: str):
+def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None):
     """Baixa, corta o final, legenda e converte para .ts padronizado.
-    Retorna (ok, título)."""
-    out_file = VIDEO_DIR / f"{video_id}.ts"
+    Retorna (ok, título). out_dir/cut_end permitem canais convidados."""
+    out_dir = out_dir or VIDEO_DIR
+    cut_end = CUT_END_SECONDS if cut_end is None else cut_end
+    out_file = out_dir / f"{video_id}.ts"
     if out_file.exists():
         return True, None
 
@@ -704,9 +786,9 @@ def download_and_normalize(video_id: str):
     # corte dos segundos finais
     t_limit = None
     dur = video_duration(raw)
-    if dur and dur > CUT_END_SECONDS + 5:
-        t_limit = dur - CUT_END_SECONDS
-    elif dur:
+    if cut_end > 0 and dur and dur > cut_end + 5:
+        t_limit = dur - cut_end
+    elif cut_end > 0 and dur:
         log(f"AVISO: {video_id} é muito curto ({dur:.0f}s) — não vou cortar o final.")
 
     # legendas
@@ -729,7 +811,7 @@ def download_and_normalize(video_id: str):
     title_txt.unlink(missing_ok=True)
     if ok and thumb.exists():
         # guarda a thumbnail para a tela final dos posts cortados no X
-        shutil.move(str(thumb), str(VIDEO_DIR / f"{video_id}.jpg"))
+        shutil.move(str(thumb), str(out_dir / f"{video_id}.jpg"))
     else:
         thumb.unlink(missing_ok=True)
     if ok:
@@ -794,16 +876,60 @@ def build_playlist(ids_newest_first: list):
     data = _load_titles()
     vtitles = data.get("titles", {})
     stitles = data.get("shorts", {})
-    lines, entries, slot = [], [], 0
+    gstate = data.get("guests", {})
+
+    # sequência de vídeos: canal principal em ordem cronológica + convidados
+    # inseridos nas posições configuradas
+    seq = []
+    for i in reversed(available):
+        t = vtitles.get(i, "")
+        seq.append({"path": VIDEO_DIR / f"{i}.ts",
+                    "label": f"{AGORA_PREFIX}{t}" if t else "",
+                    "guest": None})
+    for g in sorted(GUEST_CHANNELS, key=lambda x: x.get("position", 999)):
+        slug = _slug(g.get("name", ""))
+        st = gstate.get(slug)
+        if not st:
+            continue
+        p = GUESTS_DIR / slug / f"{st['id']}.ts"
+        if not p.exists():
+            continue
+        gt = st.get("title", "")
+        pos = max(0, min(int(g.get("position", 999)) - 1, len(seq)))
+        seq.insert(pos, {"path": p,
+                         "label": f"{AGORA_PREFIX}{gt}" if gt else "",
+                         "guest": slug})
+    if not seq:
+        return "", {"total": 0, "entries": []}
+
+    lines, entries, slot, normal_break = [], [], 0, 0
 
     def add(path: Path, label: str) -> None:
         lines.append(f"file '{path.as_posix()}'")
         entries.append({"d": get_duration_cached(path), "label": label})
 
-    for idx, i in enumerate(reversed(available)):
-        t = vtitles.get(i, "")
-        add(VIDEO_DIR / f"{i}.ts", f"{AGORA_PREFIX}{t}" if t else "")
-        if promo_ok and idx % PROMO_EVERY == PROMO_EVERY - 1:
+    n = len(seq)
+    for k, item in enumerate(seq):
+        add(item["path"], item["label"])
+        nxt = seq[(k + 1) % n]
+        if item["guest"] or nxt["guest"]:
+            # intervalo de convidado: vinhetas específicas, nunca shorts
+            added = False
+            if item["guest"]:
+                o = BASE_DIR / f"{item['guest']}_outro.ts"
+                if o.exists():
+                    add(o, "")
+                    added = True
+            if nxt["guest"]:
+                i_ts = BASE_DIR / f"{nxt['guest']}_intro.ts"
+                if i_ts.exists():
+                    add(i_ts, "")
+                    added = True
+            if not added and BUMPER_TS.exists():
+                add(BUMPER_TS, "")
+            continue
+        # intervalo normal: alterna vinheta/bloco promocional
+        if promo_ok and normal_break % PROMO_EVERY == PROMO_EVERY - 1:
             s = shorts[slot % len(shorts)]
             slot += 1
             st = stitles.get(s.stem, "")
@@ -813,6 +939,7 @@ def build_playlist(ids_newest_first: list):
             add(PROMO_OUTRO_TS, "")
         elif BUMPER_TS.exists():
             add(BUMPER_TS, "")  # também entre o último e o primeiro do loop
+        normal_break += 1
     text = "\n".join(lines) + "\n" if lines else ""
     sched = {"total": round(sum(e["d"] for e in entries), 3),
              "entries": entries}
@@ -891,6 +1018,7 @@ def watcher() -> None:
                 prune_old(ids)
                 backfill_titles(ids)
                 update_titles_order(ids)
+                sync_guests()
                 sync_shorts()
                 sync_playlist(ids)  # cobre remoções e recupera atualizações perdidas
         except Exception as e:
@@ -957,11 +1085,12 @@ def get_duration_cached(p: Path) -> float:
         mt = p.stat().st_mtime
     except OSError:
         return 0.0
-    ent = _dur_cache.get(p.name)
+    key = f"{p.parent.name}/{p.name}"
+    ent = _dur_cache.get(key)
     if ent and abs(ent[0] - mt) < 1:
         return ent[1]
     d = video_duration(p) or 0.0
-    _dur_cache[p.name] = [mt, d]
+    _dur_cache[key] = [mt, d]
     try:
         DURATIONS_FILE.write_text(json.dumps(_dur_cache), encoding="utf-8")
     except OSError:

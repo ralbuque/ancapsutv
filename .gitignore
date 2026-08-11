@@ -22,5 +22,8 @@ continuidade.mp4
 chamada.ts
 continuidade.ts
 shorts/
+guests/
+*.ts
+*.mp4
 __pycache__/
 cookies.txt
