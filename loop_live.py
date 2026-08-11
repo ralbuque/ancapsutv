@@ -129,6 +129,7 @@ AGORA_SHORT_TEMPLATE = _get("AGORA_SHORT_TEMPLATE",
 AGORA_FONTSIZE = _get("AGORA_FONTSIZE", 26)
 # fonte menor -> espaços mais estreitos: recuo próprio para alinhar com a barra
 AGORA_LEAD_SPACES = _get("AGORA_LEAD_SPACES", 64)
+AGORA_LIFT = _get("AGORA_LIFT", 76)  # altura da barra AGORA (maior = mais alta)
 AGORA_BOX = _get("AGORA_BOX", "0xD9D9D9")       # barra cinza clara
 AGORA_TEXTCOL = _get("AGORA_TEXTCOL", "0x1F1F1F")
 
@@ -1054,6 +1055,17 @@ def current_label(now: float) -> str:
     return ""
 
 
+def _bar_text(lead_spaces: int, content: str) -> str:
+    """Monta o texto de uma barra: 'Áp' no início força TODAS as linhas a
+    terem a mesma altura (senão a caixa varia com acentos/descendentes e o
+    vão entre as barras fica oscilando). Esses 2 caracteres ficam escondidos
+    atrás do emblema; os espaços posicionam o texto e o ljust estica a barra
+    até além da borda direita."""
+    if not content:
+        return ""
+    return ("Áp" + " " * max(lead_spaces - 2, 0) + content).ljust(340)
+
+
 def ticker_thread() -> None:
     """Alimenta ticker.txt/alert.txt/agora.txt/data.txt/hora.txt, relidos
     a cada frame pelo drawtext."""
@@ -1072,26 +1084,23 @@ def ticker_thread() -> None:
                     _write_text_file(CLOCK_TIME_FILE, h_txt)
                     last_h = h_txt
             if AGORA_ENABLED:
-                g = current_label(now)
-                if g:
-                    g = (" " * AGORA_LEAD_SPACES + g).ljust(360)
+                g = _bar_text(AGORA_LEAD_SPACES, current_label(now))
                 if g != last_g:
                     _write_text_file(AGORA_FILE, g)
                     last_g = g
             with _alert_lock:
                 a_text, a_until = _alert["text"], _alert["until"]
-            # espaços iniciais posicionam o texto depois do emblema; o ljust
-            # alonga a barra até (além de) a borda direita da tela
-            lead = " " * TICKER_LEAD_SPACES
             if a_text and now < a_until:
-                t_text, al = "", f"{lead}{ALERT_PREFIX}{a_text}".ljust(340)
+                t_text = ""
+                al = _bar_text(TICKER_LEAD_SPACES, f"{ALERT_PREFIX}{a_text}")
             else:
                 data = _load_titles()
                 titles = [data["titles"][i] for i in data.get("order", [])
                           if i in data.get("titles", {})][:TICKER_COUNT]
                 if titles:
                     idx = int(now // TICKER_SECONDS) % len(titles)
-                    t_text = f"{lead}{TICKER_PREFIX}{titles[idx]}".ljust(340)
+                    t_text = _bar_text(TICKER_LEAD_SPACES,
+                                       f"{TICKER_PREFIX}{titles[idx]}")
                 else:
                     t_text = ""
                 al = ""
@@ -1129,7 +1138,7 @@ def lower_third_filter(include_identity: bool = True) -> str:
         parts += [
             f"drawtext={font}textfile=agora.txt:reload=1:expansion=none:"
             f"fontsize={AGORA_FONTSIZE}:fontcolor={AGORA_TEXTCOL}:{offx}:"
-            f"y=h-th-76:box=1:boxcolor={AGORA_BOX}:boxborderw=12",
+            f"y=h-th-{AGORA_LIFT}:box=1:boxcolor={AGORA_BOX}:boxborderw=12",
         ]
     parts += [
         f"drawtext={font}textfile=ticker.txt:reload=1:expansion=none:"
