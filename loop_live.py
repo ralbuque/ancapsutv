@@ -127,6 +127,8 @@ AGORA_PREFIX = _get("AGORA_PREFIX", "AGORA: ")
 AGORA_SHORT_TEMPLATE = _get("AGORA_SHORT_TEMPLATE",
                             "Short do palácio assombrado {title}")
 AGORA_FONTSIZE = _get("AGORA_FONTSIZE", 26)
+# fonte menor -> espaços mais estreitos: recuo próprio para alinhar com a barra
+AGORA_LEAD_SPACES = _get("AGORA_LEAD_SPACES", 64)
 AGORA_BOX = _get("AGORA_BOX", "0xD9D9D9")       # barra cinza clara
 AGORA_TEXTCOL = _get("AGORA_TEXTCOL", "0x1F1F1F")
 
@@ -135,10 +137,10 @@ LT_CLOCK = _get("LT_CLOCK", True)
 CLOCK_UTC_OFFSET = _get("CLOCK_UTC_OFFSET", -3)  # Brasília = UTC-3
 CLOCK_COLOR = _get("CLOCK_COLOR", "0xF2B705")
 CLOCK_DATE_X = _get("CLOCK_DATE_X", 190)
-CLOCK_DATE_Y = _get("CLOCK_DATE_Y", "h-118")
+CLOCK_DATE_Y = _get("CLOCK_DATE_Y", "h-110")
 CLOCK_DATE_SIZE = _get("CLOCK_DATE_SIZE", 30)
 CLOCK_TIME_X = _get("CLOCK_TIME_X", 190)
-CLOCK_TIME_Y = _get("CLOCK_TIME_Y", "h-72")
+CLOCK_TIME_Y = _get("CLOCK_TIME_Y", "h-64")
 CLOCK_TIME_SIZE = _get("CLOCK_TIME_SIZE", 44)
 
 # ======================================================================
@@ -1072,7 +1074,7 @@ def ticker_thread() -> None:
             if AGORA_ENABLED:
                 g = current_label(now)
                 if g:
-                    g = (" " * TICKER_LEAD_SPACES + g).ljust(340)
+                    g = (" " * AGORA_LEAD_SPACES + g).ljust(360)
                 if g != last_g:
                     _write_text_file(AGORA_FILE, g)
                     last_g = g

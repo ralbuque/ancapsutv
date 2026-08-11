@@ -56,9 +56,10 @@ AGORA_SHORT_TEMPLATE = "Short do palácio assombrado {title}"
 LT_CLOCK = True
 CLOCK_UTC_OFFSET = -3            # Brasília (independe do fuso do servidor)
 CLOCK_DATE_X = 190               # posições dentro do emblema (ajuste ao PNG)
-CLOCK_DATE_Y = "h-118"
+CLOCK_DATE_Y = "h-110"
 CLOCK_TIME_X = 190
-CLOCK_TIME_Y = "h-72"
+CLOCK_TIME_Y = "h-64"
+AGORA_LEAD_SPACES = 64           # recuo do texto AGORA (fonte menor = mais espaços)
 ALERT_PREFIX = "LANÇADO: "       # prefixo do aviso de vídeo novo
 TICKER_BOX = "0xF2B705"          # cor da barra normal (dourada)
 ALERT_BOX = "0xEF7B6D"           # cor da barra de alerta (salmão)
