@@ -1180,7 +1180,12 @@ def _load_titles() -> dict:
 def _save_titles(data: dict) -> None:
     tmp = TITLES_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(TITLES_FILE)
+    for _ in range(10):
+        try:
+            tmp.replace(TITLES_FILE)
+            return
+        except OSError:
+            time.sleep(0.05)  # leitor concorrente segura o arquivo no Windows
 
 
 def save_title(video_id: str, title: str) -> None:
@@ -1350,14 +1355,33 @@ def current_label(now: float) -> str:
 
 
 def save_resume() -> None:
-    """Grava qual arquivo está no ar, para retomar dali no próximo início."""
+    """Grava o ponto de retomada. Vinhetas repetem na playlist e tornariam a
+    rotação ambígua — então ancora no próximo item ÚNICO (vídeo/short) a
+    partir da posição atual."""
+    sched = _load_schedule()
     e = current_entry()
-    if e and e.get("f"):
-        try:
-            RESUME_FILE.write_text(json.dumps({"file": e["f"]}),
-                                   encoding="utf-8")
-        except OSError:
-            pass
+    if not e or not sched:
+        return
+    entries = sched.get("entries", [])
+    counts = {}
+    for x in entries:
+        f = x.get("f")
+        counts[f] = counts.get(f, 0) + 1
+    try:
+        idx = entries.index(e)
+    except ValueError:
+        idx = 0
+    n = len(entries)
+    for k in range(n):
+        cand = entries[(idx + k) % n]
+        f = cand.get("f")
+        if f and counts.get(f) == 1:
+            try:
+                RESUME_FILE.write_text(json.dumps({"file": f}),
+                                       encoding="utf-8")
+            except OSError:
+                pass
+            return
 
 
 def _mark_resume_playlist_head() -> None:
