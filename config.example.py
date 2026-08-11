@@ -19,6 +19,7 @@ CUT_END_SECONDS = 10     # segundos removidos do final de cada vídeo
 
 BURN_SUBTITLES = True    # legendas queimadas no vídeo
 WHISPER_MODEL = "small"  # "base" (rápido) / "small" (recomendado) / "medium" (lento)
+WHISPER_THREADS = 2      # núcleos usados na transcrição (deixe folga p/ a live)
 SUBTITLE_STYLE = ("FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,"
                   "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
                   "Shadow=0,MarginV=60")  # 60 ≈ 225px do rodapé (folga p/ lower third)
@@ -48,6 +49,16 @@ ALERT_MINUTES = 10    # duração do aviso de vídeo novo
 LOWER_THIRD_BADGE = "badge.png"  # PNG transparente com o emblema (nome+canal);
                                  # se existir, substitui os textos da esquerda
 TICKER_LEAD_SPACES = 56          # espaços antes do texto (para sair do emblema)
+
+# Barra "AGORA" (título do item em exibição) e relógio
+AGORA_ENABLED = True
+AGORA_SHORT_TEMPLATE = "Short do palácio assombrado {title}"
+LT_CLOCK = True
+CLOCK_UTC_OFFSET = -3            # Brasília (independe do fuso do servidor)
+CLOCK_DATE_X = 190               # posições dentro do emblema (ajuste ao PNG)
+CLOCK_DATE_Y = "h-118"
+CLOCK_TIME_X = 190
+CLOCK_TIME_Y = "h-72"
 ALERT_PREFIX = "LANÇADO: "       # prefixo do aviso de vídeo novo
 TICKER_BOX = "0xF2B705"          # cor da barra normal (dourada)
 ALERT_BOX = "0xEF7B6D"           # cor da barra de alerta (salmão)

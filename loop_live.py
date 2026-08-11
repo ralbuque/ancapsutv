@@ -30,7 +30,7 @@ import sys
 import textwrap
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ============================ CONFIGURAÇÃO ============================
@@ -60,6 +60,7 @@ BUMPER_SOURCE_NAME = _get("BUMPER_SOURCE_NAME", "vinheta.mp4")
 CUT_END_SECONDS = _get("CUT_END_SECONDS", 10)
 BURN_SUBTITLES = _get("BURN_SUBTITLES", True)
 WHISPER_MODEL = _get("WHISPER_MODEL", "small")
+WHISPER_THREADS = _get("WHISPER_THREADS", 2)  # limita a CPU da transcrição
 SUBTITLE_STYLE = _get("SUBTITLE_STYLE",
                       "FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,"
                       "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
@@ -120,6 +121,26 @@ TICKER_TEXTCOL = _get("TICKER_TEXTCOL", "0x1F1F1F")
 ALERT_BOX = _get("ALERT_BOX", "0xEF7B6D")       # barra salmão (alerta)
 ALERT_TEXTCOL = _get("ALERT_TEXTCOL", "0x1F1F1F")
 
+# Barra "AGORA" (título do item em exibição, acima da barra de títulos)
+AGORA_ENABLED = _get("AGORA_ENABLED", True)
+AGORA_PREFIX = _get("AGORA_PREFIX", "AGORA: ")
+AGORA_SHORT_TEMPLATE = _get("AGORA_SHORT_TEMPLATE",
+                            "Short do palácio assombrado {title}")
+AGORA_FONTSIZE = _get("AGORA_FONTSIZE", 26)
+AGORA_BOX = _get("AGORA_BOX", "0xD9D9D9")       # barra cinza clara
+AGORA_TEXTCOL = _get("AGORA_TEXTCOL", "0x1F1F1F")
+
+# Relógio (escrito pelo script já convertido para o fuso configurado)
+LT_CLOCK = _get("LT_CLOCK", True)
+CLOCK_UTC_OFFSET = _get("CLOCK_UTC_OFFSET", -3)  # Brasília = UTC-3
+CLOCK_COLOR = _get("CLOCK_COLOR", "0xF2B705")
+CLOCK_DATE_X = _get("CLOCK_DATE_X", 190)
+CLOCK_DATE_Y = _get("CLOCK_DATE_Y", "h-118")
+CLOCK_DATE_SIZE = _get("CLOCK_DATE_SIZE", 30)
+CLOCK_TIME_X = _get("CLOCK_TIME_X", 190)
+CLOCK_TIME_Y = _get("CLOCK_TIME_Y", "h-72")
+CLOCK_TIME_SIZE = _get("CLOCK_TIME_SIZE", 44)
+
 # ======================================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -150,7 +171,13 @@ VOCAB_FILE = BASE_DIR / "vocabulario.txt"    # nomes próprios e siglas, 1 por l
 FIXES_FILE = BASE_DIR / "correcoes.txt"      # linhas "errado => certo"
 TICKER_FILE = BASE_DIR / "ticker.txt"        # texto da barra (lido pelo ffmpeg)
 ALERT_FILE = BASE_DIR / "alert.txt"          # texto do alerta "NOVO VÍDEO"
+AGORA_FILE = BASE_DIR / "agora.txt"          # título do item em exibição
+CLOCK_DATE_FILE = BASE_DIR / "data.txt"      # data (fuso convertido)
+CLOCK_TIME_FILE = BASE_DIR / "hora.txt"      # hora (fuso convertido)
 TITLES_FILE = BASE_DIR / "titles.json"       # títulos recentes p/ o ticker
+SCHEDULE_FILE = BASE_DIR / "schedule.json"       # grade de exibição ativa
+SCHEDULE_PENDING = BASE_DIR / "schedule_new.json"
+DURATIONS_FILE = BASE_DIR / "durations.json"     # cache de durações
 DOWNLOAD_PAUSE = _get("DOWNLOAD_PAUSE", 20)  # segundos entre downloads seguidos
 RTMP_URL = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
 
@@ -167,6 +194,21 @@ def ytdlp_cmd() -> list:
 restart_event = threading.Event()   # avisa o streamer que a playlist mudou
 _whisper_model = None
 _stream_proc = None                 # ffmpeg da transmissão em execução
+_play = {"pos": 0.0, "at": 0.0}     # posição de exibição (via -progress)
+
+
+def _progress_reader(proc) -> None:
+    """Lê o -progress do ffmpeg e atualiza a posição de exibição."""
+    try:
+        for line in proc.stdout:
+            if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                try:
+                    _play["pos"] = int(line.strip().split("=", 1)[1]) / 1_000_000
+                    _play["at"] = time.time()
+                except ValueError:
+                    pass
+    except Exception:
+        pass
 
 
 def kill_stream() -> None:
@@ -184,12 +226,21 @@ def log(msg: str) -> None:
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
+# Prioridades (Windows): a transmissão roda ACIMA do normal e todo o
+# processamento em lote ABAIXO — quando disputam CPU, a live vence.
+_PRIO_LOW = (subprocess.BELOW_NORMAL_PRIORITY_CLASS
+             if os.name == "nt" else 0)
+_PRIO_HIGH = (subprocess.ABOVE_NORMAL_PRIORITY_CLASS
+              if os.name == "nt" else 0)
+
+
 def run(cmd: list, **kw) -> subprocess.CompletedProcess:
     # PYTHONUTF8 força o yt-dlp a emitir UTF-8 no Windows (senão títulos com
     # acentos saem na codificação regional e viram caracteres inválidos)
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     return subprocess.run(cmd, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", env=env, **kw)
+                          encoding="utf-8", errors="replace", env=env,
+                          creationflags=_PRIO_LOW, **kw)
 
 
 def safe_unlink(p: Path) -> None:
@@ -218,7 +269,8 @@ def get_whisper():
         log(f"Carregando modelo Whisper '{WHISPER_MODEL}' "
             "(na primeira execução o modelo é baixado)...")
         _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu",
-                                      compute_type="int8")
+                                      compute_type="int8",
+                                      cpu_threads=WHISPER_THREADS)
     return _whisper_model
 
 
@@ -712,6 +764,13 @@ def sync_shorts() -> None:
         if normalize_short(raw, SHORTS_DIR / f"{sid}.ts"):
             log(f"Short {sid} pronto.")
         safe_unlink(raw)
+    # títulos dos shorts (para o "AGORA"), incluindo os já convertidos
+    known = _load_titles().get("shorts", {})
+    for sid in [i for i in ids if (SHORTS_DIR / f"{i}.ts").exists()
+                and i not in known][:5]:
+        t = fetch_title(sid)
+        if t:
+            save_short_title(sid, t)
     keep = {f"{i}.ts" for i in ids}
     for f in SHORTS_DIR.glob("*.ts"):
         if f.name not in keep:
@@ -719,37 +778,53 @@ def sync_shorts() -> None:
             safe_unlink(f)
 
 
-def build_playlist_text(ids_newest_first: list) -> str:
-    """Playlist em ordem cronológica. Nos intervalos, alterna a vinheta com o
-    bloco promocional (chamada -> short do outro canal -> continuidade)."""
+def build_playlist(ids_newest_first: list):
+    """Playlist em ordem cronológica + grade de exibição (duração e rótulo
+    'AGORA' de cada item). Nos intervalos, alterna a vinheta com o bloco
+    promocional (chamada -> short do outro canal -> continuidade)."""
     available = [i for i in ids_newest_first if (VIDEO_DIR / f"{i}.ts").exists()]
-    bumper = f"file '{BUMPER_TS.as_posix()}'" if BUMPER_TS.exists() else None
     shorts = (sorted(SHORTS_DIR.glob("*.ts"),
                      key=lambda p: p.stat().st_mtime, reverse=True)
               if SHORTS_DIR.exists() else [])
     promo_ok = (PROMO_ENABLED and PROMO_EVERY > 0 and shorts
                 and PROMO_INTRO_TS.exists() and PROMO_OUTRO_TS.exists())
-    lines, slot = [], 0
+    data = _load_titles()
+    vtitles = data.get("titles", {})
+    stitles = data.get("shorts", {})
+    lines, entries, slot = [], [], 0
+
+    def add(path: Path, label: str) -> None:
+        lines.append(f"file '{path.as_posix()}'")
+        entries.append({"d": get_duration_cached(path), "label": label})
+
     for idx, i in enumerate(reversed(available)):
-        lines.append(f"file '{(VIDEO_DIR / f'{i}.ts').as_posix()}'")
+        t = vtitles.get(i, "")
+        add(VIDEO_DIR / f"{i}.ts", f"{AGORA_PREFIX}{t}" if t else "")
         if promo_ok and idx % PROMO_EVERY == PROMO_EVERY - 1:
             s = shorts[slot % len(shorts)]
             slot += 1
-            lines += [f"file '{PROMO_INTRO_TS.as_posix()}'",
-                      f"file '{s.as_posix()}'",
-                      f"file '{PROMO_OUTRO_TS.as_posix()}'"]
-        elif bumper:
-            lines.append(bumper)  # também entre o último e o primeiro do loop
-    return "\n".join(lines) + "\n" if lines else ""
+            st = stitles.get(s.stem, "")
+            add(PROMO_INTRO_TS, "")   # vinhetas sem texto no AGORA
+            add(s, f"{AGORA_PREFIX}"
+                   f"{AGORA_SHORT_TEMPLATE.format(title=st)}" if st else "")
+            add(PROMO_OUTRO_TS, "")
+        elif BUMPER_TS.exists():
+            add(BUMPER_TS, "")  # também entre o último e o primeiro do loop
+    text = "\n".join(lines) + "\n" if lines else ""
+    sched = {"total": round(sum(e["d"] for e in entries), 3),
+             "entries": entries}
+    return text, sched
 
 
 def sync_playlist(ids_newest_first: list) -> None:
     """Se a playlist desejada mudou, grava em playlist_new.txt e pede reinício.
     O streamer troca o arquivo só com o FFmpeg parado — no Windows não dá para
-    substituir o playlist.txt enquanto o FFmpeg o mantém aberto."""
-    desired = build_playlist_text(ids_newest_first)
+    substituir o playlist.txt enquanto o FFmpeg o mantém aberto. A grade do
+    AGORA (schedule) acompanha a playlist correspondente."""
+    desired, sched = build_playlist(ids_newest_first)
     if not desired:
         return
+    sched_json = json.dumps(sched, ensure_ascii=False)
     if PLAYLIST_PENDING.exists():
         current = PLAYLIST_PENDING.read_text(encoding="utf-8")
     elif PLAYLIST.exists():
@@ -757,10 +832,20 @@ def sync_playlist(ids_newest_first: list) -> None:
     else:
         current = ""
     if desired != current:
+        SCHEDULE_PENDING.write_text(sched_json, encoding="utf-8")
         tmp = PLAYLIST_PENDING.with_suffix(".tmp")
         tmp.write_text(desired, encoding="utf-8")
         tmp.replace(PLAYLIST_PENDING)
         restart_event.set()
+    elif not PLAYLIST_PENDING.exists():
+        # playlist igual, mas rótulos podem ter mudado (título recuperado):
+        # atualiza a grade ativa direto (só o nosso thread a lê)
+        try:
+            cur_sched = SCHEDULE_FILE.read_text(encoding="utf-8")
+        except OSError:
+            cur_sched = ""
+        if sched_json != cur_sched:
+            SCHEDULE_FILE.write_text(sched_json, encoding="utf-8")
 
 
 def prune_old(keep_ids: list) -> None:
@@ -846,6 +931,41 @@ def save_title(video_id: str, title: str) -> None:
     _save_titles(data)
 
 
+def save_short_title(short_id: str, title: str) -> None:
+    if not title:
+        return
+    data = _load_titles()
+    data.setdefault("shorts", {})[short_id] = title
+    _save_titles(data)
+
+
+_dur_cache = None
+
+
+def get_duration_cached(p: Path) -> float:
+    """Duração do arquivo, com cache em disco (chave: nome + mtime)."""
+    global _dur_cache
+    if _dur_cache is None:
+        try:
+            _dur_cache = json.loads(DURATIONS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _dur_cache = {}
+    try:
+        mt = p.stat().st_mtime
+    except OSError:
+        return 0.0
+    ent = _dur_cache.get(p.name)
+    if ent and abs(ent[0] - mt) < 1:
+        return ent[1]
+    d = video_duration(p) or 0.0
+    _dur_cache[p.name] = [mt, d]
+    try:
+        DURATIONS_FILE.write_text(json.dumps(_dur_cache), encoding="utf-8")
+    except OSError:
+        pass
+    return d
+
+
 def fetch_title(vid: str) -> str:
     """Busca só o título de um vídeo (sem baixar), sempre em UTF-8."""
     TMP_DIR.mkdir(exist_ok=True)
@@ -887,27 +1007,75 @@ def update_titles_order(ids_newest_first: list) -> None:
 
 
 def _write_text_file(path: Path, text: str) -> None:
-    """Escrita atômica com tolerância ao ffmpeg relendo o arquivo (Windows)."""
-    tmp = path.with_suffix(path.suffix + ".w")
-    tmp.write_text(text, encoding="utf-8")
+    """Escrita DIRETA, sem renomeio: o drawtext reabre o arquivo a cada frame
+    e a troca por rename no Windows bloqueia a leitura por um instante,
+    derrubando o FFmpeg. No pior caso da escrita direta, um único frame
+    mostra texto parcial — imperceptível."""
     for _ in range(5):
         try:
-            tmp.replace(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
             return
         except OSError:
             time.sleep(0.05)
-    try:  # último recurso: escrita direta
-        path.write_text(text, encoding="utf-8")
+
+
+_sched_cache = {"mtime": 0.0, "data": None}
+
+
+def _load_schedule():
+    try:
+        mt = SCHEDULE_FILE.stat().st_mtime
     except OSError:
-        pass
+        return None
+    if mt != _sched_cache["mtime"]:
+        try:
+            _sched_cache["data"] = json.loads(
+                SCHEDULE_FILE.read_text(encoding="utf-8"))
+            _sched_cache["mtime"] = mt
+        except Exception:
+            pass
+    return _sched_cache["data"]
+
+
+def current_label(now: float) -> str:
+    """Rótulo do item em exibição, cruzando a posição (via -progress do
+    ffmpeg) com a grade de durações da playlist."""
+    sched = _load_schedule()
+    if not sched or not sched.get("total") or not _play["at"]:
+        return ""
+    pos = (_play["pos"] + min(now - _play["at"], 5.0)) % sched["total"]
+    for e in sched.get("entries", []):
+        pos -= e.get("d", 0)
+        if pos < 0:
+            return e.get("label", "")
+    return ""
 
 
 def ticker_thread() -> None:
-    """Alimenta ticker.txt/alert.txt, relidos a cada frame pelo drawtext."""
-    last_t, last_a = None, None
+    """Alimenta ticker.txt/alert.txt/agora.txt/data.txt/hora.txt, relidos
+    a cada frame pelo drawtext."""
+    last_t, last_a, last_g, last_d, last_h = None, None, None, None, None
+    tz = timezone(timedelta(hours=CLOCK_UTC_OFFSET))
     while True:
         try:
             now = time.time()
+            if LT_CLOCK:
+                loc = datetime.now(tz)
+                d_txt, h_txt = f"{loc:%Y-%m-%d}", f"{loc:%H:%M}"
+                if d_txt != last_d:
+                    _write_text_file(CLOCK_DATE_FILE, d_txt)
+                    last_d = d_txt
+                if h_txt != last_h:
+                    _write_text_file(CLOCK_TIME_FILE, h_txt)
+                    last_h = h_txt
+            if AGORA_ENABLED:
+                g = current_label(now)
+                if g:
+                    g = (" " * TICKER_LEAD_SPACES + g).ljust(340)
+                if g != last_g:
+                    _write_text_file(AGORA_FILE, g)
+                    last_g = g
             with _alert_lock:
                 a_text, a_until = _alert["text"], _alert["until"]
             # espaços iniciais posicionam o texto depois do emblema; o ljust
@@ -955,6 +1123,12 @@ def lower_third_filter(include_identity: bool = True) -> str:
             f"drawtext={font}text='{chan}':fontsize=26:fontcolor=0xFFD75E:"
             f"x=24:y=h-68:box=1:boxcolor=0x101010@0.85:boxborderw=12",
         ]
+    if AGORA_ENABLED:
+        parts += [
+            f"drawtext={font}textfile=agora.txt:reload=1:expansion=none:"
+            f"fontsize={AGORA_FONTSIZE}:fontcolor={AGORA_TEXTCOL}:{offx}:"
+            f"y=h-th-76:box=1:boxcolor={AGORA_BOX}:boxborderw=12",
+        ]
     parts += [
         f"drawtext={font}textfile=ticker.txt:reload=1:expansion=none:"
         f"fontsize=28:fontcolor={TICKER_TEXTCOL}:{offx}:y=h-th-16:"
@@ -966,6 +1140,22 @@ def lower_third_filter(include_identity: bool = True) -> str:
     return ",".join(parts)
 
 
+def clock_filter() -> str:
+    """Relógio (data + hora) desenhado por cima do emblema."""
+    if not LT_CLOCK:
+        return ""
+    font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
+            if Path(INTRO_FONT).exists() else "")
+    return (
+        f"drawtext={font}textfile=data.txt:reload=1:expansion=none:"
+        f"fontsize={CLOCK_DATE_SIZE}:fontcolor={CLOCK_COLOR}:"
+        f"x={CLOCK_DATE_X}:y={CLOCK_DATE_Y},"
+        f"drawtext={font}textfile=hora.txt:reload=1:expansion=none:"
+        f"fontsize={CLOCK_TIME_SIZE}:fontcolor={CLOCK_COLOR}:"
+        f"x={CLOCK_TIME_X}:y={CLOCK_TIME_Y}"
+    )
+
+
 # ---------------------------- STREAMER --------------------------------
 
 def apply_pending_playlist() -> None:
@@ -975,6 +1165,8 @@ def apply_pending_playlist() -> None:
     for _ in range(10):
         try:
             PLAYLIST_PENDING.replace(PLAYLIST)
+            if SCHEDULE_PENDING.exists():
+                SCHEDULE_PENDING.replace(SCHEDULE_FILE)
             log("Playlist atualizada.")
             return
         except PermissionError:
@@ -999,15 +1191,21 @@ def streamer() -> None:
         ]
         if LOWER_THIRD:
             badge = BASE_DIR / LOWER_THIRD_BADGE
+            clock = clock_filter()
             if badge.exists():
-                # barras via drawtext + emblema PNG sobreposto por cima
+                # barras via drawtext + emblema PNG + relógio por cima dele
+                tail = f";[vb]{clock}[vout]" if clock else ""
+                out_v = "[vb]" if clock else "[vout]"
                 fc = (f"[0:v]{lower_third_filter(include_identity=False)}[v0];"
-                      f"[v0][1:v]overlay=0:main_h-overlay_h[vout]")
+                      f"[v0][1:v]overlay=0:main_h-overlay_h{out_v}{tail}")
                 cmd += ["-loop", "1", "-i", badge.name,
                         "-filter_complex", fc,
                         "-map", "[vout]", "-map", "0:a"]
             else:
-                cmd += ["-vf", lower_third_filter()]
+                vf = lower_third_filter()
+                if clock:
+                    vf += f",{clock}"
+                cmd += ["-vf", vf]
             cmd += ["-c:v", "libx264", "-preset", LOWER_THIRD_PRESET,
                     "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE,
                     "-bufsize", "9000k", "-g", str(FPS * 2),
@@ -1018,9 +1216,19 @@ def streamer() -> None:
             cmd += ["-c", "copy"]
             log("Iniciando transmissão...")
         cmd += ["-bsf:a", "aac_adtstoasc", "-f", "flv", RTMP_URL]
+        if LOWER_THIRD:
+            cmd += ["-progress", "pipe:1", "-stats_period", "1"]
         global _stream_proc
-        proc = subprocess.Popen(cmd, cwd=str(BASE_DIR))
+        _play["pos"], _play["at"] = 0.0, time.time()
+        proc = subprocess.Popen(
+            cmd, cwd=str(BASE_DIR), creationflags=_PRIO_HIGH,
+            stdout=subprocess.PIPE if LOWER_THIRD else None,
+            text=LOWER_THIRD or None, encoding="utf-8" if LOWER_THIRD else None,
+            errors="replace" if LOWER_THIRD else None)
         _stream_proc = proc
+        if LOWER_THIRD:
+            threading.Thread(target=_progress_reader, args=(proc,),
+                             daemon=True, name="progress").start()
 
         # espera o processo cair ou a playlist mudar
         while proc.poll() is None and not restart_event.is_set():
@@ -1077,7 +1285,8 @@ def main() -> None:
         f"{'ativadas (' + WHISPER_MODEL + ')' if BURN_SUBTITLES else 'desativadas'}")
     if LOWER_THIRD:
         # os arquivos precisam existir antes do primeiro ffmpeg com drawtext
-        for f in (TICKER_FILE, ALERT_FILE):
+        for f in (TICKER_FILE, ALERT_FILE, AGORA_FILE,
+                  CLOCK_DATE_FILE, CLOCK_TIME_FILE):
             if not f.exists():
                 f.write_text("", encoding="utf-8")
         threading.Thread(target=ticker_thread, daemon=True,

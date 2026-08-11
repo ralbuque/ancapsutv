@@ -7,7 +7,13 @@ playlist_new.txt
 *.srt
 ticker.txt
 alert.txt
+agora.txt
+data.txt
+hora.txt
 titles.json
+schedule.json
+schedule_new.json
+durations.json
 badge.png
 bumper.ts
 vinheta.mp4
