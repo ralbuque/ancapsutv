@@ -21,8 +21,10 @@ Requisitos no Windows: Python 3.9+, ffmpeg.exe e yt-dlp.exe no PATH,
 e "pip install faster-whisper" para as legendas. Veja o README.md.
 """
 
+import itertools
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -129,6 +131,7 @@ ALERT_TEXTCOL = _get("ALERT_TEXTCOL", "0x1F1F1F")
 # Barra "AGORA" (título do item em exibição, acima da barra de títulos)
 AGORA_ENABLED = _get("AGORA_ENABLED", True)
 AGORA_PREFIX = _get("AGORA_PREFIX", "AGORA: ")
+AGORA_BUMPER_LABEL = _get("AGORA_BUMPER_LABEL", "Vinheta")  # texto nas vinhetas
 AGORA_SHORT_TEMPLATE = _get("AGORA_SHORT_TEMPLATE",
                             "Short do palácio assombrado {title}")
 AGORA_FONTSIZE = _get("AGORA_FONTSIZE", 26)
@@ -192,6 +195,7 @@ TITLES_FILE = BASE_DIR / "titles.json"       # títulos recentes p/ o ticker
 SCHEDULE_FILE = BASE_DIR / "schedule.json"       # grade de exibição ativa
 SCHEDULE_PENDING = BASE_DIR / "schedule_new.json"
 DURATIONS_FILE = BASE_DIR / "durations.json"     # cache de durações
+RESUME_FILE = BASE_DIR / "resume.json"           # item em exibição (retomada)
 DOWNLOAD_PAUSE = _get("DOWNLOAD_PAUSE", 20)  # segundos entre downloads seguidos
 RTMP_URL = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
 
@@ -208,11 +212,35 @@ def ytdlp_cmd() -> list:
 restart_event = threading.Event()   # avisa o streamer que a playlist mudou
 _whisper_model = None
 _stream_proc = None                 # ffmpeg da transmissão em execução
+_state_lock = threading.Lock()      # protege titles.json (ler-modificar-gravar)
+_pl_lock = threading.Lock()         # protege a escrita da playlist/grade
+_last_ids = []                      # última lista de IDs do canal principal
+
+# Fila de processamento pesado: a detecção enfileira, um worker único executa
+# (serial de propósito — evita várias transcrições disputando CPU)
+_job_q = queue.PriorityQueue()
+_job_seq = itertools.count()
+_queued = set()
+_queued_lock = threading.Lock()
+
+
+def enqueue_job(kind: str, vid: str, cfg: dict = None, prio: int = 1) -> None:
+    """Enfileira um trabalho, sem duplicar o que já está na fila/execução."""
+    slug = _slug(cfg["name"]) if cfg else ""
+    key = f"{kind}:{slug}:{vid}"
+    with _queued_lock:
+        if key in _queued:
+            return
+        _queued.add(key)
+    _job_q.put((prio, next(_job_seq),
+                {"kind": kind, "id": vid, "cfg": cfg, "key": key}))
 _play = {"pos": 0.0, "at": 0.0}     # posição de exibição (via -progress)
 
 
 def _progress_reader(proc) -> None:
-    """Lê o -progress do ffmpeg e atualiza a posição de exibição."""
+    """Lê o -progress do ffmpeg e atualiza a posição de exibição.
+    Periodicamente grava a retomada (cobre quedas e Ctrl+C)."""
+    n = 0
     try:
         for line in proc.stdout:
             if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
@@ -220,7 +248,10 @@ def _progress_reader(proc) -> None:
                     _play["pos"] = int(line.strip().split("=", 1)[1]) / 1_000_000
                     _play["at"] = time.time()
                 except ValueError:
-                    pass
+                    continue
+                n += 1
+                if n % 30 == 0:  # ~a cada 15s (progress reporta 2 linhas/s)
+                    save_resume()
     except Exception:
         pass
 
@@ -476,9 +507,9 @@ def prepare_bumper() -> None:
                            f"a vinheta de saída de {g.get('name')}")
 
 
-def sync_guests() -> None:
-    """Baixa o vídeo mais recente de cada canal convidado, processa igual aos
-    do canal principal e posta no X com as credenciais do canal."""
+def detect_guests() -> None:
+    """Detecção leve: enfileira vídeo novo de cada canal convidado e limpa
+    antigos (só depois que o atual está pronto, para não furar a playlist)."""
     for g in GUEST_CHANNELS:
         try:
             name = g.get("name", "?")
@@ -498,29 +529,14 @@ def sync_guests() -> None:
                 continue
             vid = ids[0]
             if not (gdir / f"{vid}.ts").exists():
-                log(f"Vídeo novo em {name}: {vid}")
-                ok, title = download_and_normalize(
-                    vid, out_dir=gdir, cut_end=g.get("cut_end"))
-                if ok:
-                    data = _load_titles()
-                    data.setdefault("guests", {})[slug] = {
-                        "id": vid, "title": title or ""}
-                    _save_titles(data)
-                    log(f"{name}: pronto para o ciclo.")
-                    ck = [g.get("x_api_key"), g.get("x_api_secret"),
-                          g.get("x_access_token"),
-                          g.get("x_access_token_secret")]
-                    if all(ck):
-                        post_to_x(vid, title or "", src_dir=gdir,
-                                  creds={"api_key": ck[0],
-                                         "api_secret": ck[1],
-                                         "access_token": ck[2],
-                                         "access_token_secret": ck[3]})
-            # só o vídeo atual fica no disco
-            for f in list(gdir.glob("*.ts")) + list(gdir.glob("*.jpg")):
-                if f.stem != vid:
-                    log(f"Removendo antigo de {name}: {f.name}")
-                    safe_unlink(f)
+                log(f"Vídeo novo em {name}: {vid} — na fila de processamento.")
+                enqueue_job("guest", vid, cfg=g, prio=0)
+            else:
+                # atual pronto: pode limpar os anteriores
+                for f in list(gdir.glob("*.ts")) + list(gdir.glob("*.jpg")):
+                    if f.stem != vid:
+                        log(f"Removendo antigo de {name}: {f.name}")
+                        safe_unlink(f)
         except Exception as e:
             log(f"ERRO no canal convidado {g.get('name', '?')}: {e}")
 
@@ -819,8 +835,9 @@ def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None):
     return ok, title
 
 
-def sync_shorts() -> None:
-    """Baixa e converte os shorts mais recentes do outro canal (rodízio)."""
+def detect_shorts() -> None:
+    """Detecção leve: enfileira shorts que faltam, busca títulos e limpa
+    os que saíram do rodízio."""
     if not PROMO_ENABLED or not PROMO_CHANNEL_URL:
         return
     SHORTS_DIR.mkdir(exist_ok=True)
@@ -833,22 +850,7 @@ def sync_shorts() -> None:
         return
     ids = [l.strip() for l in r.stdout.splitlines() if l.strip()]
     for sid in [i for i in ids if not (SHORTS_DIR / f"{i}.ts").exists()]:
-        time.sleep(DOWNLOAD_PAUSE)
-        TMP_DIR.mkdir(exist_ok=True)
-        raw = TMP_DIR / f"s_{sid}.mp4"
-        log(f"Baixando short {sid}...")
-        r2 = run(ytdlp_cmd() + [
-            "-f", "bv*[height<=1920]+ba/b",
-            "--merge-output-format", "mp4",
-            "-o", str(raw),
-            f"https://www.youtube.com/watch?v={sid}",
-        ])
-        if r2.returncode != 0 or not raw.exists():
-            log(f"ERRO no download do short {sid}: {r2.stderr.strip()[-200:]}")
-            continue
-        if normalize_short(raw, SHORTS_DIR / f"{sid}.ts"):
-            log(f"Short {sid} pronto.")
-        safe_unlink(raw)
+        enqueue_job("short", sid, prio=1)  # prioridade menor que vídeos
     # títulos dos shorts (para o "AGORA"), incluindo os já convertidos
     known = _load_titles().get("shorts", {})
     for sid in [i for i in ids if (SHORTS_DIR / f"{i}.ts").exists()
@@ -861,6 +863,75 @@ def sync_shorts() -> None:
         if f.name not in keep:
             log(f"Removendo short antigo: {f.name}")
             safe_unlink(f)
+
+
+def process_short(sid: str) -> bool:
+    """Baixa e converte um short (executado pelo worker)."""
+    TMP_DIR.mkdir(exist_ok=True)
+    raw = TMP_DIR / f"s_{sid}.mp4"
+    log(f"Baixando short {sid}...")
+    r = run(ytdlp_cmd() + [
+        "-f", "bv*[height<=1920]+ba/b",
+        "--merge-output-format", "mp4",
+        "-o", str(raw),
+        f"https://www.youtube.com/watch?v={sid}",
+    ])
+    if r.returncode != 0 or not raw.exists():
+        log(f"ERRO no download do short {sid}: {r.stderr.strip()[-200:]}")
+        return False
+    ok = normalize_short(raw, SHORTS_DIR / f"{sid}.ts")
+    safe_unlink(raw)
+    if ok:
+        log(f"Short {sid} pronto.")
+    return ok
+
+
+def worker() -> None:
+    """Consumidor único da fila: downloads, transcrições e conversões rodam
+    aqui, em série, sem travar a detecção de vídeos novos."""
+    last_dl = 0.0
+    while True:
+        _prio, _seq, job = _job_q.get()
+        try:
+            wait = DOWNLOAD_PAUSE - (time.time() - last_dl)
+            if wait > 0:
+                time.sleep(wait)  # não martelar o YouTube
+            last_dl = time.time()
+            kind, vid = job["kind"], job["id"]
+            if kind == "main":
+                ok, title = download_and_normalize(vid)
+                if ok:
+                    save_title(vid, title or "")
+                    sync_playlist(_last_ids)
+                    log(f"{vid} entrou no loop.")
+                    post_to_x(vid, title or "")
+            elif kind == "guest":
+                g = job["cfg"]
+                slug = _slug(g.get("name", ""))
+                gdir = GUESTS_DIR / slug
+                ok, title = download_and_normalize(
+                    vid, out_dir=gdir, cut_end=g.get("cut_end"))
+                if ok:
+                    save_guest_state(slug, vid, title or "")
+                    sync_playlist(_last_ids)
+                    log(f"{g.get('name')}: {vid} entrou no ciclo.")
+                    ck = [g.get("x_api_key"), g.get("x_api_secret"),
+                          g.get("x_access_token"),
+                          g.get("x_access_token_secret")]
+                    if all(ck):
+                        post_to_x(vid, title or "", src_dir=gdir,
+                                  creds={"api_key": ck[0],
+                                         "api_secret": ck[1],
+                                         "access_token": ck[2],
+                                         "access_token_secret": ck[3]})
+            elif kind == "short":
+                if process_short(vid):
+                    sync_playlist(_last_ids)
+        except Exception as e:
+            log(f"ERRO no processamento ({job['kind']} {job['id']}): {e}")
+        finally:
+            with _queued_lock:
+                _queued.discard(job["key"])
 
 
 def build_playlist(ids_newest_first: list):
@@ -906,7 +977,8 @@ def build_playlist(ids_newest_first: list):
 
     def add(path: Path, label: str) -> None:
         lines.append(f"file '{path.as_posix()}'")
-        entries.append({"d": get_duration_cached(path), "label": label})
+        entries.append({"d": get_duration_cached(path), "label": label,
+                        "f": path.as_posix()})
 
     n = len(seq)
     for k, item in enumerate(seq):
@@ -918,27 +990,28 @@ def build_playlist(ids_newest_first: list):
             if item["guest"]:
                 o = BASE_DIR / f"{item['guest']}_outro.ts"
                 if o.exists():
-                    add(o, "")
+                    add(o, AGORA_BUMPER_LABEL)
                     added = True
             if nxt["guest"]:
                 i_ts = BASE_DIR / f"{nxt['guest']}_intro.ts"
                 if i_ts.exists():
-                    add(i_ts, "")
+                    add(i_ts, AGORA_BUMPER_LABEL)
                     added = True
             if not added and BUMPER_TS.exists():
-                add(BUMPER_TS, "")
+                add(BUMPER_TS, AGORA_BUMPER_LABEL)
             continue
         # intervalo normal: alterna vinheta/bloco promocional
         if promo_ok and normal_break % PROMO_EVERY == PROMO_EVERY - 1:
             s = shorts[slot % len(shorts)]
             slot += 1
             st = stitles.get(s.stem, "")
-            add(PROMO_INTRO_TS, "")   # vinhetas sem texto no AGORA
+            add(PROMO_INTRO_TS, AGORA_BUMPER_LABEL)
             add(s, f"{AGORA_PREFIX}"
                    f"{AGORA_SHORT_TEMPLATE.format(title=st)}" if st else "")
-            add(PROMO_OUTRO_TS, "")
+            add(PROMO_OUTRO_TS, AGORA_BUMPER_LABEL)
         elif BUMPER_TS.exists():
-            add(BUMPER_TS, "")  # também entre o último e o primeiro do loop
+            # também entre o último e o primeiro do loop
+            add(BUMPER_TS, AGORA_BUMPER_LABEL)
         normal_break += 1
     text = "\n".join(lines) + "\n" if lines else ""
     sched = {"total": round(sum(e["d"] for e in entries), 3),
@@ -946,30 +1019,58 @@ def build_playlist(ids_newest_first: list):
     return text, sched
 
 
+def _find_rotation(canonical: list, current: list):
+    """k tal que canonical rotacionado por k == current; None se não houver."""
+    if len(canonical) != len(current):
+        return None
+    if not canonical:
+        return 0
+    for k in range(len(canonical)):
+        if (canonical[k] == current[0]
+                and canonical[k:] + canonical[:k] == current):
+            return k
+    return None
+
+
 def sync_playlist(ids_newest_first: list) -> None:
-    """Se a playlist desejada mudou, grava em playlist_new.txt e pede reinício.
-    O streamer troca o arquivo só com o FFmpeg parado — no Windows não dá para
-    substituir o playlist.txt enquanto o FFmpeg o mantém aberto. A grade do
-    AGORA (schedule) acompanha a playlist correspondente."""
+    """Versão com trava (chamada pelo monitor e pelo worker)."""
+    if not ids_newest_first:
+        return
+    with _pl_lock:
+        _sync_playlist_inner(ids_newest_first)
+
+
+def _sync_playlist_inner(ids_newest_first: list) -> None:
+    """Se o CONTEÚDO da playlist mudou, grava em playlist_new.txt e pede
+    reinício (o streamer troca o arquivo só com o FFmpeg parado). A playlist
+    ativa pode estar rotacionada pela retomada de posição — rotação não conta
+    como mudança. A grade do AGORA acompanha a playlist correspondente."""
     desired, sched = build_playlist(ids_newest_first)
     if not desired:
         return
-    sched_json = json.dumps(sched, ensure_ascii=False)
     if PLAYLIST_PENDING.exists():
         current = PLAYLIST_PENDING.read_text(encoding="utf-8")
     elif PLAYLIST.exists():
         current = PLAYLIST.read_text(encoding="utf-8")
     else:
         current = ""
-    if desired != current:
-        SCHEDULE_PENDING.write_text(sched_json, encoding="utf-8")
+    d_lines = [l for l in desired.splitlines() if l.strip()]
+    c_lines = [l for l in current.splitlines() if l.strip()]
+    k = _find_rotation(d_lines, c_lines)
+    if k is None:
+        # conteúdo realmente mudou -> playlist canônica + grade pendentes
+        SCHEDULE_PENDING.write_text(json.dumps(sched, ensure_ascii=False),
+                                    encoding="utf-8")
         tmp = PLAYLIST_PENDING.with_suffix(".tmp")
         tmp.write_text(desired, encoding="utf-8")
         tmp.replace(PLAYLIST_PENDING)
         restart_event.set()
     elif not PLAYLIST_PENDING.exists():
-        # playlist igual, mas rótulos podem ter mudado (título recuperado):
-        # atualiza a grade ativa direto (só o nosso thread a lê)
+        # mesmo ciclo (talvez rotacionado); se rótulos mudaram, atualiza a
+        # grade ativa alinhada à rotação atual (só o nosso thread a lê)
+        ents = sched["entries"]
+        sched["entries"] = ents[k:] + ents[:k]
+        sched_json = json.dumps(sched, ensure_ascii=False)
         try:
             cur_sched = SCHEDULE_FILE.read_text(encoding="utf-8")
         except OSError:
@@ -987,12 +1088,16 @@ def prune_old(keep_ids: list) -> None:
 
 
 def watcher() -> None:
+    """Só DETECÇÃO (rápida): novidades geram aviso imediato e entram na fila;
+    o worker faz o trabalho pesado sem atrasar o próximo ciclo."""
+    global _last_ids
     VIDEO_DIR.mkdir(exist_ok=True)
     while True:
         try:
             prepare_bumper()
             ids = latest_video_ids()
             if ids:
+                _last_ids = ids
                 new = [i for i in ids if not (VIDEO_DIR / f"{i}.ts").exists()]
                 # aviso imediato no ticker: o vídeo JÁ está no canal, mesmo
                 # que o processamento (legendas etc.) ainda vá demorar
@@ -1005,21 +1110,12 @@ def watcher() -> None:
                             set_alert(t)
                             log(f"Vídeo novo no canal — aviso no ticker: {t[:60]}")
                 update_titles_order(ids)
-                for k, vid in enumerate(new):
-                    if k > 0:
-                        time.sleep(DOWNLOAD_PAUSE)  # não martelar o YouTube
-                    ok, title = download_and_normalize(vid)
-                    if ok:
-                        # entra no ar imediatamente, sem esperar o lote todo
-                        save_title(vid, title or "")
-                        sync_playlist(ids)
-                        log(f"{vid} entrou no loop.")
-                        post_to_x(vid, title or "")
+                for vid in new:
+                    enqueue_job("main", vid, prio=0)
                 prune_old(ids)
                 backfill_titles(ids)
-                update_titles_order(ids)
-                sync_guests()
-                sync_shorts()
+                detect_guests()
+                detect_shorts()
                 sync_playlist(ids)  # cobre remoções e recupera atualizações perdidas
         except Exception as e:
             log(f"ERRO inesperado no monitor: {e}")
@@ -1057,17 +1153,26 @@ def _save_titles(data: dict) -> None:
 def save_title(video_id: str, title: str) -> None:
     if not title:
         return
-    data = _load_titles()
-    data["titles"][video_id] = title
-    _save_titles(data)
+    with _state_lock:
+        data = _load_titles()
+        data["titles"][video_id] = title
+        _save_titles(data)
 
 
 def save_short_title(short_id: str, title: str) -> None:
     if not title:
         return
-    data = _load_titles()
-    data.setdefault("shorts", {})[short_id] = title
-    _save_titles(data)
+    with _state_lock:
+        data = _load_titles()
+        data.setdefault("shorts", {})[short_id] = title
+        _save_titles(data)
+
+
+def save_guest_state(slug: str, vid: str, title: str) -> None:
+    with _state_lock:
+        data = _load_titles()
+        data.setdefault("guests", {})[slug] = {"id": vid, "title": title}
+        _save_titles(data)
 
 
 _dur_cache = None
@@ -1131,11 +1236,12 @@ def backfill_titles(ids: list) -> None:
 
 
 def update_titles_order(ids_newest_first: list) -> None:
-    data = _load_titles()
-    data["order"] = ids_newest_first
-    data["titles"] = {i: t for i, t in data["titles"].items()
-                      if i in ids_newest_first}
-    _save_titles(data)
+    with _state_lock:
+        data = _load_titles()
+        data["order"] = ids_newest_first
+        data["titles"] = {i: t for i, t in data["titles"].items()
+                          if i in ids_newest_first}
+        _save_titles(data)
 
 
 def _write_text_file(path: Path, text: str) -> None:
@@ -1173,18 +1279,67 @@ def _load_schedule():
     return _sched_cache["data"]
 
 
-def current_label(now: float) -> str:
-    """Rótulo do item em exibição, cruzando a posição (via -progress do
-    ffmpeg) com a grade de durações da playlist."""
+def current_entry(now: float = None):
+    """Item em exibição, cruzando a posição (via -progress do ffmpeg) com a
+    grade de durações da playlist. Retorna o dict da grade ou None."""
     sched = _load_schedule()
     if not sched or not sched.get("total") or not _play["at"]:
-        return ""
+        return None
+    now = now or time.time()
     pos = (_play["pos"] + min(now - _play["at"], 5.0)) % sched["total"]
     for e in sched.get("entries", []):
         pos -= e.get("d", 0)
         if pos < 0:
-            return e.get("label", "")
-    return ""
+            return e
+    return None
+
+
+def current_label(now: float) -> str:
+    e = current_entry(now)
+    return e.get("label", "") if e else ""
+
+
+def save_resume() -> None:
+    """Grava qual arquivo está no ar, para retomar dali no próximo início."""
+    e = current_entry()
+    if e and e.get("f"):
+        try:
+            RESUME_FILE.write_text(json.dumps({"file": e["f"]}),
+                                   encoding="utf-8")
+        except OSError:
+            pass
+
+
+def rotate_for_resume() -> None:
+    """Com o FFmpeg parado, rotaciona playlist.txt + grade para o loop
+    continuar do item que estava no ar, em vez de voltar ao início."""
+    try:
+        target = json.loads(
+            RESUME_FILE.read_text(encoding="utf-8")).get("file")
+    except Exception:
+        return
+    if not target or not PLAYLIST.exists() or not SCHEDULE_FILE.exists():
+        return
+    try:
+        lines = [l for l in PLAYLIST.read_text(encoding="utf-8").splitlines()
+                 if l.strip()]
+        sched = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
+        entries = sched.get("entries", [])
+        if len(lines) != len(entries):
+            return
+        idx = next((i for i, e in enumerate(entries)
+                    if e.get("f") == target), None)
+        if not idx:  # None (saiu do ciclo) ou 0 (já é o primeiro)
+            return
+        PLAYLIST.write_text("\n".join(lines[idx:] + lines[:idx]) + "\n",
+                            encoding="utf-8")
+        sched["entries"] = entries[idx:] + entries[:idx]
+        SCHEDULE_FILE.write_text(json.dumps(sched, ensure_ascii=False),
+                                 encoding="utf-8")
+        log(f"Retomando o loop a partir de: {Path(target).name}")
+    except Exception as e:
+        log(f"AVISO: não consegui retomar a posição ({e}) — "
+            "começando do início.")
 
 
 def _bar_text(lead_spaces: int, content: str) -> str:
@@ -1321,6 +1476,7 @@ def apply_pending_playlist() -> None:
 def streamer() -> None:
     while True:
         apply_pending_playlist()
+        rotate_for_resume()
         if not PLAYLIST.exists() or not PLAYLIST.read_text(encoding="utf-8").strip():
             log("Aguardando vídeos na playlist...")
             time.sleep(10)
@@ -1359,24 +1515,23 @@ def streamer() -> None:
             cmd += ["-c", "copy"]
             log("Iniciando transmissão...")
         cmd += ["-bsf:a", "aac_adtstoasc", "-f", "flv", RTMP_URL]
-        if LOWER_THIRD:
-            cmd += ["-progress", "pipe:1", "-stats_period", "1"]
+        # -progress alimenta o AGORA e a retomada de posição (sempre ativo)
+        cmd += ["-progress", "pipe:1", "-stats_period", "1"]
         global _stream_proc
         _play["pos"], _play["at"] = 0.0, time.time()
         proc = subprocess.Popen(
             cmd, cwd=str(BASE_DIR), creationflags=_PRIO_HIGH,
-            stdout=subprocess.PIPE if LOWER_THIRD else None,
-            text=LOWER_THIRD or None, encoding="utf-8" if LOWER_THIRD else None,
-            errors="replace" if LOWER_THIRD else None)
+            stdout=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace")
         _stream_proc = proc
-        if LOWER_THIRD:
-            threading.Thread(target=_progress_reader, args=(proc,),
-                             daemon=True, name="progress").start()
+        threading.Thread(target=_progress_reader, args=(proc,),
+                         daemon=True, name="progress").start()
 
         # espera o processo cair ou a playlist mudar
         while proc.poll() is None and not restart_event.is_set():
             time.sleep(2)
 
+        save_resume()  # guarda o item no ar para retomar dali
         if proc.poll() is None:
             log("Reiniciando FFmpeg com a playlist nova...")
             proc.terminate()
@@ -1435,6 +1590,7 @@ def main() -> None:
                 f.write_text("\n", encoding="utf-8")
         threading.Thread(target=ticker_thread, daemon=True,
                          name="ticker").start()
+    threading.Thread(target=worker, daemon=True, name="worker").start()
     threading.Thread(target=watcher, daemon=True, name="watcher").start()
     try:
         streamer()
