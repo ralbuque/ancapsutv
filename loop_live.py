@@ -106,7 +106,17 @@ LOWER_THIRD_CHANNEL = _get("LOWER_THIRD_CHANNEL", "ANCAPSU")
 LOWER_THIRD_PRESET = _get("LOWER_THIRD_PRESET", "veryfast")
 TICKER_COUNT = _get("TICKER_COUNT", 3)      # quantos títulos ciclam na barra
 TICKER_SECONDS = _get("TICKER_SECONDS", 8)  # segundos que cada título fica
-ALERT_MINUTES = _get("ALERT_MINUTES", 10)   # duração do aviso "NOVO VÍDEO"
+ALERT_MINUTES = _get("ALERT_MINUTES", 10)   # duração do aviso de vídeo novo
+# Arte: PNG transparente com o emblema (nome+canal); se existir, substitui
+# os textos da esquerda e as barras começam depois dele
+LOWER_THIRD_BADGE = _get("LOWER_THIRD_BADGE", "badge.png")
+TICKER_X = _get("TICKER_X", 430)            # onde a barra de títulos começa
+TICKER_PREFIX = _get("TICKER_PREFIX", "")
+ALERT_PREFIX = _get("ALERT_PREFIX", "LANÇADO: ")
+TICKER_BOX = _get("TICKER_BOX", "0xF2B705")     # barra dourada
+TICKER_TEXTCOL = _get("TICKER_TEXTCOL", "0x1F1F1F")
+ALERT_BOX = _get("ALERT_BOX", "0xEF7B6D")       # barra salmão (alerta)
+ALERT_TEXTCOL = _get("ALERT_TEXTCOL", "0x1F1F1F")
 
 # ======================================================================
 
@@ -766,6 +776,7 @@ def watcher() -> None:
                         set_alert(title or "")
                         post_to_x(vid, title or "")
                 prune_old(ids)
+                backfill_titles(ids)
                 update_titles_order(ids)
                 sync_shorts()
                 sync_playlist(ids)  # cobre remoções e recupera atualizações perdidas
@@ -810,6 +821,31 @@ def save_title(video_id: str, title: str) -> None:
     _save_titles(data)
 
 
+def backfill_titles(ids: list) -> None:
+    """Busca (sem re-baixar) os títulos de vídeos processados antes do ticker
+    existir, para a barra não ficar vazia."""
+    if not LOWER_THIRD:
+        return
+    data = _load_titles()
+    missing = [i for i in ids if i not in data.get("titles", {})
+               and (VIDEO_DIR / f"{i}.ts").exists()]
+    for vid in missing[:5]:  # poucos por ciclo, para não pesar
+        TMP_DIR.mkdir(exist_ok=True)
+        out = TMP_DIR / f"t_{vid}.info.json"
+        run(ytdlp_cmd() + ["--skip-download", "--write-info-json",
+                           "-o", str(TMP_DIR / f"t_{vid}"),
+                           f"https://www.youtube.com/watch?v={vid}"])
+        if out.exists():
+            try:
+                t = json.loads(out.read_text(encoding="utf-8")).get("title", "")
+                if t:
+                    save_title(vid, t)
+                    log(f"Título recuperado para o ticker: {t[:60]}")
+            except Exception:
+                pass
+            safe_unlink(out)
+
+
 def update_titles_order(ids_newest_first: list) -> None:
     data = _load_titles()
     data["order"] = ids_newest_first
@@ -843,14 +879,15 @@ def ticker_thread() -> None:
             with _alert_lock:
                 a_text, a_until = _alert["text"], _alert["until"]
             if a_text and now < a_until:
-                t_text, al = "", f"NOVO VÍDEO  •  {a_text}"
+                # o padding alonga a barra até a borda direita da tela
+                t_text, al = "", f"{ALERT_PREFIX}{a_text}".ljust(220)
             else:
                 data = _load_titles()
                 titles = [data["titles"][i] for i in data.get("order", [])
                           if i in data.get("titles", {})][:TICKER_COUNT]
                 if titles:
                     idx = int(now // TICKER_SECONDS) % len(titles)
-                    t_text = f"ÚLTIMOS VÍDEOS  •  {titles[idx]}"
+                    t_text = f"{TICKER_PREFIX}{titles[idx]}".ljust(220)
                 else:
                     t_text = ""
                 al = ""
@@ -865,26 +902,32 @@ def ticker_thread() -> None:
         time.sleep(1)
 
 
-def lower_third_filter() -> str:
+def lower_third_filter(include_identity: bool = True) -> str:
     """Filtro drawtext do lower third. Os arquivos de texto são relidos a cada
-    frame (reload=1); com texto vazio, a barra é movida para fora da tela."""
+    frame (reload=1); com texto vazio, a barra é movida para fora da tela.
+    include_identity=False quando o emblema (badge.png) cobre nome/canal."""
     font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
             if Path(INTRO_FONT).exists() else "")
-    name = LOWER_THIRD_NAME.replace("'", "").replace(":", "\\:")
-    chan = LOWER_THIRD_CHANNEL.replace("'", "").replace(":", "\\:")
-    offx = "x=if(gt(text_w\\,2)\\,330\\,w+50)"
-    return (
-        f"drawtext={font}text='{name}':fontsize=30:fontcolor=white:"
-        f"x=24:y=h-121:box=1:boxcolor=0x101010@0.85:boxborderw=12,"
-        f"drawtext={font}text='{chan}':fontsize=26:fontcolor=0xFFD75E:"
-        f"x=24:y=h-68:box=1:boxcolor=0x101010@0.85:boxborderw=12,"
+    offx = f"x=if(gt(text_w\\,2)\\,{TICKER_X}\\,w+50)"
+    parts = []
+    if include_identity:
+        name = LOWER_THIRD_NAME.replace("'", "").replace(":", "\\:")
+        chan = LOWER_THIRD_CHANNEL.replace("'", "").replace(":", "\\:")
+        parts += [
+            f"drawtext={font}text='{name}':fontsize=30:fontcolor=white:"
+            f"x=24:y=h-121:box=1:boxcolor=0x101010@0.85:boxborderw=12",
+            f"drawtext={font}text='{chan}':fontsize=26:fontcolor=0xFFD75E:"
+            f"x=24:y=h-68:box=1:boxcolor=0x101010@0.85:boxborderw=12",
+        ]
+    parts += [
         f"drawtext={font}textfile=ticker.txt:reload=1:expansion=none:"
-        f"fontsize=28:fontcolor=white:{offx}:y=h-68:"
-        f"box=1:boxcolor=0x0B57D0@0.85:boxborderw=14,"
+        f"fontsize=28:fontcolor={TICKER_TEXTCOL}:{offx}:y=h-68:"
+        f"box=1:boxcolor={TICKER_BOX}:boxborderw=16",
         f"drawtext={font}textfile=alert.txt:reload=1:expansion=none:"
-        f"fontsize=28:fontcolor=white:{offx}:y=h-68:"
-        f"box=1:boxcolor=0xCC1111@0.92:boxborderw=14"
-    )
+        f"fontsize=28:fontcolor={ALERT_TEXTCOL}:{offx}:y=h-68:"
+        f"box=1:boxcolor={ALERT_BOX}:boxborderw=16",
+    ]
+    return ",".join(parts)
 
 
 # ---------------------------- STREAMER --------------------------------
@@ -919,8 +962,17 @@ def streamer() -> None:
             "-f", "concat", "-safe", "0", "-i", str(PLAYLIST),
         ]
         if LOWER_THIRD:
-            cmd += ["-vf", lower_third_filter(),
-                    "-c:v", "libx264", "-preset", LOWER_THIRD_PRESET,
+            badge = BASE_DIR / LOWER_THIRD_BADGE
+            if badge.exists():
+                # barras via drawtext + emblema PNG sobreposto por cima
+                fc = (f"[0:v]{lower_third_filter(include_identity=False)}[v0];"
+                      f"[v0][1:v]overlay=24:main_h-overlay_h-26[vout]")
+                cmd += ["-loop", "1", "-i", badge.name,
+                        "-filter_complex", fc,
+                        "-map", "[vout]", "-map", "0:a"]
+            else:
+                cmd += ["-vf", lower_third_filter()]
+            cmd += ["-c:v", "libx264", "-preset", LOWER_THIRD_PRESET,
                     "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE,
                     "-bufsize", "9000k", "-g", str(FPS * 2),
                     "-c:a", "copy"]
