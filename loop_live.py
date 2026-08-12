@@ -87,6 +87,28 @@ X_ENDCARD = _get("X_ENDCARD", True)  # tela "veja no YouTube" nos posts cortados
 # Reply automático ao post com o link do YouTube ("" desativa)
 X_REPLY_TEMPLATE = _get("X_REPLY_TEMPLATE", "Veja o vídeo completo em {url}")
 
+# Instagram/TikTok via Ayrshare: versão vertical (1080x1920) de cada vídeo
+# novo do canal principal, com legenda re-queimada e 1º comentário com o link
+AYRSHARE_ENABLED = _get("AYRSHARE_ENABLED", False)
+AYRSHARE_API_KEY = _get("AYRSHARE_API_KEY", "")
+AYR_PLATFORMS = _get("AYR_PLATFORMS", ["instagram", "tiktok"])
+AYR_CAPTION_TEMPLATE = _get("AYR_CAPTION_TEMPLATE", "{title}")
+AYR_COMMENT_TEMPLATE = _get("AYR_COMMENT_TEMPLATE",
+                            "Veja o vídeo completo em {url}")
+AYR_MAX_SECONDS = _get("AYR_MAX_SECONDS", 1190)  # <20min (teto do Reels)
+VERT_CROP = _get("VERT_CROP", 0.667)      # mantém os 2/3 esquerdos do vídeo
+VERT_BG = _get("VERT_BG", "0xD35A25")     # cor das faixas (laranja do mock)
+VERT_TEXTCOL = _get("VERT_TEXTCOL", "0x1F1F1F")
+VERT_BITRATE = _get("VERT_BITRATE", "3500k")
+VERT_CHANNEL_TEXT = _get("VERT_CHANNEL_TEXT", "Canal ANCAPSU")
+VERT_CTA_LINES = _get("VERT_CTA_LINES",
+                      ["Veja o vídeo completo", "no YouTube", "",
+                       "Link no primeiro", "comentário"])
+VERT_SUB_STYLE = _get("VERT_SUB_STYLE",
+                      "FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,"
+                      "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
+                      "Shadow=0,MarginV=30")
+
 # Bloco promocional do outro canal (alterna com a vinheta nos intervalos):
 # chamada.mp4 -> um short do outro canal -> continuidade.mp4
 PROMO_ENABLED = _get("PROMO_ENABLED", False)
@@ -230,16 +252,18 @@ _queued = set()
 _queued_lock = threading.Lock()
 
 
-def enqueue_job(kind: str, vid: str, cfg: dict = None, prio: int = 1) -> None:
-    """Enfileira um trabalho, sem duplicar o que já está na fila/execução."""
+def enqueue_job(kind: str, vid: str, cfg: dict = None, prio: int = 1) -> bool:
+    """Enfileira um trabalho, sem duplicar o que já está na fila/execução.
+    Retorna True se realmente entrou na fila."""
     slug = _slug(cfg["name"]) if cfg else ""
     key = f"{kind}:{slug}:{vid}"
     with _queued_lock:
         if key in _queued:
-            return
+            return False
         _queued.add(key)
     _job_q.put((prio, next(_job_seq),
                 {"kind": kind, "id": vid, "cfg": cfg, "key": key}))
+    return True
 _play = {"pos": 0.0, "at": 0.0}     # posição de exibição (via -progress)
 
 
@@ -542,8 +566,9 @@ def detect_guests() -> None:
                 continue
             vid = ids[0]
             if not (gdir / f"{vid}.ts").exists():
-                log(f"Vídeo novo em {name}: {vid} — na fila de processamento.")
-                enqueue_job("guest", vid, cfg=g, prio=0)
+                if enqueue_job("guest", vid, cfg=g, prio=0):
+                    log(f"Vídeo novo em {name}: {vid} — "
+                        "na fila de processamento.")
             else:
                 # atual pronto: limpa anteriores (nunca os ainda na playlist)
                 refs = _referenced_files()
@@ -553,6 +578,140 @@ def detect_guests() -> None:
                         safe_unlink(f)
         except Exception as e:
             log(f"ERRO no canal convidado {g.get('name', '?')}: {e}")
+
+
+# -------------------- INSTAGRAM/TIKTOK (AYRSHARE) ---------------------
+
+def build_vertical(video_id: str, title: str):
+    """Monta a versão vertical 1080x1920 conforme o layout: faixa superior
+    (título + thumbnail + chamada), vídeo com o 1/3 direito cortado e legenda
+    re-queimada centrada no novo corte, faixa inferior com o canal.
+    Usa o mp4 bruto e o .srt mantidos no tmp/. Retorna o mp4 ou None."""
+    raw = TMP_DIR / f"{video_id}.mp4"
+    srt = TMP_DIR / f"{video_id}.srt"
+    thumb = VIDEO_DIR / f"{video_id}.jpg"
+    out = TMP_DIR / f"{video_id}_vert.mp4"
+    if not raw.exists():
+        log(f"Vertical: mp4 bruto de {video_id} não disponível — pulando.")
+        return None
+    font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
+            if Path(INTRO_FONT).exists() else "")
+
+    # título em arquivos por linha (mesma técnica do banner)
+    tfiles = []
+    for i, ln in enumerate(textwrap.wrap(title or "", width=36)[:2]):
+        lf = TMP_DIR / f"{video_id}.v{i}.txt"
+        lf.write_text(ln, encoding="utf-8")
+        tfiles.append(lf)
+
+    subs = (f",subtitles={srt.name}:force_style='{VERT_SUB_STYLE}'"
+            if srt.exists() else "")
+    fc = (f"color=c={VERT_BG}:s=1080x1920:r={FPS}[bg];"
+          f"[0:v]crop=trunc(iw*{VERT_CROP}/2)*2:ih:0:0,"
+          f"scale=1080:-2{subs},fps={FPS}[v0];"
+          f"[bg][v0]overlay=0:(H-h)/2+80:shortest=1[c0]")
+    cur = "c0"
+    n = 1
+    if thumb.exists():
+        fc = f"[1:v]scale=400:-2[tb];" + fc.replace("[c0]", "[cpre]")
+        fc += f";[cpre][tb]overlay=40:230[c0]"
+        n = 2
+    for i, lf in enumerate(tfiles):
+        fc += (f";[{cur}]drawtext={font}textfile={lf.name}:fontsize=52:"
+               f"fontcolor={VERT_TEXTCOL}:x=40:y={40 + i * 66}[d{i}]")
+        cur = f"d{i}"
+    y = 250
+    for i, ln in enumerate(VERT_CTA_LINES):
+        txt = ln.replace("'", "").replace(":", "\\:")
+        if txt.strip():
+            fc += (f";[{cur}]drawtext={font}text='{txt}':fontsize=34:"
+                   f"fontcolor={VERT_TEXTCOL}:x=480:y={y}[e{i}]")
+            cur = f"e{i}"
+        y += 46
+    chan = VERT_CHANNEL_TEXT.replace("'", "").replace(":", "\\:")
+    fc += (f";[{cur}]drawtext={font}text='{chan}':fontsize=56:"
+           f"fontcolor={VERT_TEXTCOL}:x=(w-text_w)/2:y=1750[vout]")
+
+    cmd = ["ffmpeg", "-y", "-i", f"./{raw.name}"]
+    if n == 2:
+        cmd += ["-i", str(thumb)]
+    cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
+            "-t", str(AYR_MAX_SECONDS),
+            "-c:v", "libx264", "-preset", X264_PRESET,
+            "-b:v", VERT_BITRATE, "-maxrate", VERT_BITRATE,
+            "-bufsize", "7000k", "-g", str(FPS * 2),
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-movflags", "+faststart", f"./{out.name}"]
+    r = run(cmd, cwd=str(TMP_DIR))
+    for lf in tfiles:
+        safe_unlink(lf)
+    if r.returncode != 0 or not out.exists():
+        log(f"ERRO na versão vertical de {video_id}: "
+            f"{r.stderr.strip()[-300:]}")
+        return None
+    return out
+
+
+def ayrshare_post(video_path: Path, caption: str, comment: str) -> None:
+    """Envia o vídeo à Ayrshare e publica nas plataformas configuradas,
+    com o primeiro comentário em seguida."""
+    import requests
+    hdr = {"Authorization": f"Bearer {AYRSHARE_API_KEY}"}
+    r = requests.get("https://api.ayrshare.com/api/media/uploadUrl",
+                     params={"contentType": "video/mp4",
+                             "fileName": video_path.name},
+                     headers=hdr, timeout=60)
+    r.raise_for_status()
+    j = r.json()
+    log(f"Ayrshare: enviando {video_path.name} "
+        f"({video_path.stat().st_size / 1e6:.0f} MB)...")
+    with open(video_path, "rb") as f:
+        r2 = requests.put(j["uploadUrl"], data=f,
+                          headers={"Content-Type": "video/mp4"}, timeout=3600)
+    r2.raise_for_status()
+    r3 = requests.post("https://api.ayrshare.com/api/post",
+                       json={"post": caption[:2200],
+                             "platforms": AYR_PLATFORMS,
+                             "mediaUrls": [j["accessUrl"]],
+                             "isVideo": True},
+                       headers=hdr, timeout=300)
+    r3.raise_for_status()
+    resp = r3.json()
+    pid = resp.get("id")
+    log(f"Ayrshare: publicado em {', '.join(AYR_PLATFORMS)} (id {pid}).")
+    if comment and pid:
+        for attempt in range(3):  # o post pode demorar a ficar ativo
+            rc = requests.post("https://api.ayrshare.com/api/comments",
+                               json={"id": pid, "comment": comment[:500]},
+                               headers=hdr, timeout=120)
+            if rc.ok:
+                log("Ayrshare: primeiro comentário publicado.")
+                return
+            time.sleep(90)
+        log(f"AVISO: comentário Ayrshare falhou: {rc.text[:200]}")
+
+
+def post_to_socials(video_id: str, title: str) -> None:
+    """Versão vertical -> Ayrshare. Limpa os temporários ao final."""
+    raw = TMP_DIR / f"{video_id}.mp4"
+    srt = TMP_DIR / f"{video_id}.srt"
+    vert = None
+    try:
+        if not AYRSHARE_ENABLED or not AYRSHARE_API_KEY:
+            return
+        vert = build_vertical(video_id, title)
+        if vert:
+            url = f"https://youtu.be/{video_id}"
+            ayrshare_post(vert,
+                          AYR_CAPTION_TEMPLATE.format(title=title, url=url),
+                          AYR_COMMENT_TEMPLATE.format(title=title, url=url))
+    except Exception as e:
+        log(f"ERRO ao publicar via Ayrshare ({video_id}): {e}")
+    finally:
+        safe_unlink(raw)
+        safe_unlink(srt)
+        if vert:
+            safe_unlink(vert)
 
 
 # ------------------------- POST NO X ----------------------------------
@@ -769,9 +928,11 @@ def latest_video_ids() -> list:
     return [l.strip() for l in r.stdout.splitlines() if l.strip()]
 
 
-def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None):
+def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None,
+                           keep_temp: bool = False):
     """Baixa, corta o final, legenda e converte para .ts padronizado.
-    Retorna (ok, título). out_dir/cut_end permitem canais convidados."""
+    Retorna (ok, título). out_dir/cut_end permitem canais convidados.
+    keep_temp mantém o mp4 bruto e o .srt no tmp/ (p/ a versão vertical)."""
     out_dir = out_dir or VIDEO_DIR
     cut_end = CUT_END_SECONDS if cut_end is None else cut_end
     out_file = out_dir / f"{video_id}.ts"
@@ -839,8 +1000,9 @@ def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None):
     log(f"Normalizando {video_id}...")
     ok = normalize(raw, out_file, t_limit=t_limit, srt=srt_ok,
                    thumb=thumb, title_lines=title_lines)
-    raw.unlink(missing_ok=True)
-    srt.unlink(missing_ok=True)
+    if not keep_temp:
+        safe_unlink(raw)
+        safe_unlink(srt)
     for lf in title_lines:
         safe_unlink(lf)
     if ok and thumb.exists():
@@ -917,12 +1079,14 @@ def worker() -> None:
             last_dl = time.time()
             kind, vid = job["kind"], job["id"]
             if kind == "main":
-                ok, title = download_and_normalize(vid)
+                ok, title = download_and_normalize(
+                    vid, keep_temp=AYRSHARE_ENABLED)
                 if ok:
                     save_title(vid, title or "")
                     sync_playlist(_last_ids)
                     log(f"{vid} entrou no loop.")
                     post_to_x(vid, title or "")
+                    post_to_socials(vid, title or "")
             elif kind == "guest":
                 g = job["cfg"]
                 slug = _slug(g.get("name", ""))

@@ -73,6 +73,18 @@ PROMO_OUTRO_NAME = "continuidade.mp4"   # "Continue agora com a TV ANCAPSU"
 PROMO_MAX_SHORTS = 10  # rodízio com os N shorts mais recentes
 PROMO_EVERY = 2        # 2 = alterna vinheta/promo; 3 = promo a cada 3 intervalos
 
+# --- Instagram/TikTok via Ayrshare (versão vertical automática) ---
+# Conecte as contas no painel da Ayrshare e cole a API Key aqui.
+AYRSHARE_ENABLED = False
+AYRSHARE_API_KEY = ""
+AYR_PLATFORMS = ["instagram", "tiktok"]
+AYR_CAPTION_TEMPLATE = "{title}"
+AYR_COMMENT_TEMPLATE = "Veja o vídeo completo em {url}"
+AYR_MAX_SECONDS = 1190   # corte da versão vertical (Reels aceita até 20 min;
+                         # OBS: Reels >3 min não são recomendados a não-seguidores)
+VERT_BG = "0xD35A25"     # cor das faixas superior/inferior
+VERT_CHANNEL_TEXT = "Canal ANCAPSU"
+
 # --- Canais convidados (1 vídeo de cada no ciclo, em posição fixa) ---
 # Coloque as vinhetas .mp4 de cada canal na pasta do script.
 GUEST_CHANNELS = [
