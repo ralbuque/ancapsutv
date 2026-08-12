@@ -145,6 +145,7 @@ AGORA_TEXTCOL = _get("AGORA_TEXTCOL", "0x1F1F1F")
 # junto com o que aparece na tela (ajuste fino: aumente se o AGORA "adianta")
 AGORA_DELAY = _get("AGORA_DELAY", 20)
 RESTART_COOLDOWN = _get("RESTART_COOLDOWN", 90)  # seg. mínimos entre reinícios
+STALL_RESTART = _get("STALL_RESTART", 120)  # seg. sem avanço => religa (0=off)
 
 # Relógio (escrito pelo script já convertido para o fuso configurado)
 LT_CLOCK = _get("LT_CLOCK", True)
@@ -1622,8 +1623,17 @@ def streamer() -> None:
         # intervalo mínimo entre reinícios voluntários, para não encadear)
         started = time.time()
         while proc.poll() is None:
+            now = time.time()
             if (restart_event.is_set()
-                    and time.time() - started >= RESTART_COOLDOWN):
+                    and now - started >= RESTART_COOLDOWN):
+                break
+            # watchdog: transmissão congelada (CPU/disco saturados) — religa
+            # em vez de acumular atraso até o YouTube derrubar a conexão
+            if (STALL_RESTART > 0 and _play["at"]
+                    and now - _play["at"] > STALL_RESTART
+                    and now - started > STALL_RESTART):
+                log(f"AVISO: transmissão sem avanço há "
+                    f"{int(now - _play['at'])}s — religando o FFmpeg.")
                 break
             time.sleep(2)
 
