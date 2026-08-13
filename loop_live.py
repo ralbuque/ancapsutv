@@ -262,7 +262,7 @@ _queued_lock = threading.Lock()
 def enqueue_job(kind: str, vid: str, cfg: dict = None, prio: int = 1) -> bool:
     """Enfileira um trabalho, sem duplicar o que já está na fila/execução.
     Retorna True se realmente entrou na fila."""
-    slug = _slug(cfg["name"]) if cfg else ""
+    slug = _slug(cfg.get("name", "")) if cfg else ""
     key = f"{kind}:{slug}:{vid}"
     with _queued_lock:
         if key in _queued:
@@ -1096,9 +1096,11 @@ def worker() -> None:
                     save_title(vid, title or "")
                     sync_playlist(_last_ids)
                     log(f"{vid} entrou no loop.")
-                    if was_posted(vid):
-                        log(f"{vid} já foi publicado nas redes — "
-                            "não repostando (reentrou no ciclo).")
+                    silent = bool(job.get("cfg") and job["cfg"].get("silent"))
+                    if silent or was_posted(vid):
+                        mark_posted(vid)
+                        log(f"{vid} é reposição de vídeo antigo — "
+                            "sem alerta e sem repostar nas redes.")
                         safe_unlink(TMP_DIR / f"{vid}.mp4")
                         safe_unlink(TMP_DIR / f"{vid}.srt")
                     else:
@@ -1326,20 +1328,23 @@ def watcher() -> None:
                 for vid in ids:
                     if not was_posted(vid):
                         mark_posted(vid)
-                # candidatos a download: topo da lista + completar o ciclo
-                # se houver menos de MAX_VIDEOS disponíveis
-                cand = [i for i in ids_all[:MAX_VIDEOS + PRUNE_MARGIN]
-                        if not (VIDEO_DIR / f"{i}.ts").exists()]
+                # candidatos NOVOS: topo da lista (alerta + redes sociais)
+                cand_top = [i for i in ids_all[:MAX_VIDEOS + PRUNE_MARGIN]
+                            if not (VIDEO_DIR / f"{i}.ts").exists()
+                            and _fail_ok(i, now)]
+                # reposição: vídeos ANTIGOS para completar o ciclo — modo
+                # silencioso (sem alerta e sem repostar nas redes)
+                backfill = []
                 if len(playable) < MAX_VIDEOS:
                     need = MAX_VIDEOS - len(playable)
-                    cand += [i for i in ids_all
-                             if i not in cand
-                             and not (VIDEO_DIR / f"{i}.ts").exists()][:need]
-                cand = [i for i in cand if _fail_ok(i, now)]
+                    backfill = [i for i in ids_all
+                                if i not in cand_top
+                                and not (VIDEO_DIR / f"{i}.ts").exists()
+                                and _fail_ok(i, now)][:need]
                 # aviso imediato no ticker: o vídeo JÁ está no canal, mesmo
                 # que o processamento (legendas etc.) ainda vá demorar
                 prev_known = _load_titles().get("order", [])
-                for vid in cand:
+                for vid in cand_top:
                     if (prev_known and vid not in prev_known
                             and not was_posted(vid)):
                         t = fetch_title(vid)
@@ -1348,8 +1353,10 @@ def watcher() -> None:
                             set_alert(t)
                             log(f"Vídeo novo no canal — aviso no ticker: {t[:60]}")
                 update_titles_order(ids)
-                for vid in cand:
+                for vid in cand_top:
                     enqueue_job("main", vid, prio=0)
+                for vid in backfill:
+                    enqueue_job("main", vid, prio=1, cfg={"silent": True})
                 # margem de histerese: mantém os N+3 disponíveis mais recentes
                 prune_old(playable[:MAX_VIDEOS + PRUNE_MARGIN])
                 backfill_titles(ids)
