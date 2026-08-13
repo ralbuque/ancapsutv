@@ -1328,32 +1328,43 @@ def watcher() -> None:
                 for vid in ids:
                     if not was_posted(vid):
                         mark_posted(vid)
-                # candidatos NOVOS: topo da lista (alerta + redes sociais)
-                cand_top = [i for i in ids_all[:MAX_VIDEOS + PRUNE_MARGIN]
-                            if not (VIDEO_DIR / f"{i}.ts").exists()
-                            and _fail_ok(i, now)]
-                # reposição: vídeos ANTIGOS para completar o ciclo — modo
-                # silencioso (sem alerta e sem repostar nas redes)
+                prev_known = _load_titles().get("order", [])
+                # NOVO de verdade = está ACIMA do primeiro vídeo conhecido na
+                # lista (que vem do mais novo para o mais velho); tudo abaixo
+                # de algo conhecido é conteúdo antigo
+                known = set(prev_known) | set(playable)
+                new_top = []
+                for i in ids_all:
+                    if i in known:
+                        break
+                    new_top.append(i)
+                new_top = [i for i in new_top[:MAX_VIDEOS + PRUNE_MARGIN]
+                           if not (VIDEO_DIR / f"{i}.ts").exists()
+                           and _fail_ok(i, now)]
+                # reposição: vídeos ANTIGOS só se faltar gente no ciclo —
+                # modo silencioso (sem alerta e sem repostar nas redes)
                 backfill = []
                 if len(playable) < MAX_VIDEOS:
                     need = MAX_VIDEOS - len(playable)
                     backfill = [i for i in ids_all
-                                if i not in cand_top
+                                if i not in new_top
                                 and not (VIDEO_DIR / f"{i}.ts").exists()
                                 and _fail_ok(i, now)][:need]
+                if not prev_known:
+                    # primeira execução: nada é "novo", tudo é carga silenciosa
+                    backfill = new_top + backfill
+                    new_top = []
                 # aviso imediato no ticker: o vídeo JÁ está no canal, mesmo
                 # que o processamento (legendas etc.) ainda vá demorar
-                prev_known = _load_titles().get("order", [])
-                for vid in cand_top:
-                    if (prev_known and vid not in prev_known
-                            and not was_posted(vid)):
+                for vid in new_top:
+                    if not was_posted(vid):
                         t = fetch_title(vid)
                         if t:
                             save_title(vid, t)
                             set_alert(t)
                             log(f"Vídeo novo no canal — aviso no ticker: {t[:60]}")
                 update_titles_order(ids)
-                for vid in cand_top:
+                for vid in new_top:
                     enqueue_job("main", vid, prio=0)
                 for vid in backfill:
                     enqueue_job("main", vid, prio=1, cfg={"silent": True})
