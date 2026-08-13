@@ -57,6 +57,12 @@ def _get(name, default=None, required=False):
 CHANNEL_URL = _get("CHANNEL_URL", required=True)
 STREAM_KEY = _get("STREAM_KEY", required=True)
 MAX_VIDEOS = _get("MAX_VIDEOS", 20)
+# vídeos members-only entram e saem da listagem e fazem a borda do top-N
+# oscilar; a margem evita apagar/reprocessar vídeos nessa flutuação
+PRUNE_MARGIN = _get("PRUNE_MARGIN", 3)
+# a janela de busca precisa atravessar filas longas de vídeos exclusivos
+# (já houve 26 agendados) para o ciclo continuar com 20 vídeos públicos
+FETCH_WINDOW_EXTRA = _get("FETCH_WINDOW_EXTRA", 30)
 CHECK_INTERVAL = _get("CHECK_INTERVAL", 300)
 BUMPER_SOURCE_NAME = _get("BUMPER_SOURCE_NAME", "vinheta.mp4")
 CUT_END_SECONDS = _get("CUT_END_SECONDS", 10)
@@ -920,7 +926,8 @@ def post_to_x(video_id: str, title: str, src_dir: Path = None,
 def latest_video_ids() -> list:
     """IDs dos últimos MAX_VIDEOS uploads do canal, do mais novo ao mais antigo."""
     r = run(ytdlp_cmd() + [
-        "--flat-playlist", "--playlist-end", str(MAX_VIDEOS),
+        "--flat-playlist",
+        "--playlist-end", str(MAX_VIDEOS + PRUNE_MARGIN + FETCH_WINDOW_EXTRA),
         "--print", "%(id)s", CHANNEL_URL,
     ])
     if r.returncode != 0:
@@ -1082,12 +1089,22 @@ def worker() -> None:
             if kind == "main":
                 ok, title = download_and_normalize(
                     vid, keep_temp=AYRSHARE_ENABLED)
-                if ok:
+                if not ok:
+                    mark_fail(vid)
+                else:
+                    clear_fail(vid)
                     save_title(vid, title or "")
                     sync_playlist(_last_ids)
                     log(f"{vid} entrou no loop.")
-                    post_to_x(vid, title or "")
-                    post_to_socials(vid, title or "")
+                    if was_posted(vid):
+                        log(f"{vid} já foi publicado nas redes — "
+                            "não repostando (reentrou no ciclo).")
+                        safe_unlink(TMP_DIR / f"{vid}.mp4")
+                        safe_unlink(TMP_DIR / f"{vid}.srt")
+                    else:
+                        mark_posted(vid)
+                        post_to_x(vid, title or "")
+                        post_to_socials(vid, title or "")
             elif kind == "guest":
                 g = job["cfg"]
                 slug = _slug(g.get("name", ""))
@@ -1121,7 +1138,8 @@ def build_playlist(ids_newest_first: list):
     """Playlist em ordem cronológica + grade de exibição (duração e rótulo
     'AGORA' de cada item). Nos intervalos, alterna a vinheta com o bloco
     promocional (chamada -> short do outro canal -> continuidade)."""
-    available = [i for i in ids_newest_first if (VIDEO_DIR / f"{i}.ts").exists()]
+    available = [i for i in ids_newest_first
+                 if (VIDEO_DIR / f"{i}.ts").exists()][:MAX_VIDEOS]
     shorts = (sorted(SHORTS_DIR.glob("*.ts"),
                      key=lambda p: p.stat().st_mtime, reverse=True)
               if SHORTS_DIR.exists() else [])
@@ -1294,24 +1312,46 @@ def watcher() -> None:
     while True:
         try:
             prepare_bumper()
-            ids = latest_video_ids()
-            if ids:
-                _last_ids = ids
-                new = [i for i in ids if not (VIDEO_DIR / f"{i}.ts").exists()]
+            ids_all = latest_video_ids()
+            if ids_all:
+                now = time.time()
+                # o ciclo da live = os MAX_VIDEOS mais recentes DISPONÍVEIS
+                # (members-only agendados não ocupam vaga)
+                playable = [i for i in ids_all
+                            if (VIDEO_DIR / f"{i}.ts").exists()]
+                ids = playable[:MAX_VIDEOS]
+                _last_ids = ids_all
+                # estoque já processado = já publicado (proteção contra
+                # repostagem quando um vídeo antigo reentra no ciclo)
+                for vid in ids:
+                    if not was_posted(vid):
+                        mark_posted(vid)
+                # candidatos a download: topo da lista + completar o ciclo
+                # se houver menos de MAX_VIDEOS disponíveis
+                cand = [i for i in ids_all[:MAX_VIDEOS + PRUNE_MARGIN]
+                        if not (VIDEO_DIR / f"{i}.ts").exists()]
+                if len(playable) < MAX_VIDEOS:
+                    need = MAX_VIDEOS - len(playable)
+                    cand += [i for i in ids_all
+                             if i not in cand
+                             and not (VIDEO_DIR / f"{i}.ts").exists()][:need]
+                cand = [i for i in cand if _fail_ok(i, now)]
                 # aviso imediato no ticker: o vídeo JÁ está no canal, mesmo
                 # que o processamento (legendas etc.) ainda vá demorar
                 prev_known = _load_titles().get("order", [])
-                for vid in new:
-                    if prev_known and vid not in prev_known:
+                for vid in cand:
+                    if (prev_known and vid not in prev_known
+                            and not was_posted(vid)):
                         t = fetch_title(vid)
                         if t:
                             save_title(vid, t)
                             set_alert(t)
                             log(f"Vídeo novo no canal — aviso no ticker: {t[:60]}")
                 update_titles_order(ids)
-                for vid in new:
+                for vid in cand:
                     enqueue_job("main", vid, prio=0)
-                prune_old(ids)
+                # margem de histerese: mantém os N+3 disponíveis mais recentes
+                prune_old(playable[:MAX_VIDEOS + PRUNE_MARGIN])
                 backfill_titles(ids)
                 detect_guests()
                 detect_shorts()
@@ -1377,6 +1417,49 @@ def save_guest_state(slug: str, vid: str, title: str) -> None:
         data = _load_titles()
         data.setdefault("guests", {})[slug] = {"id": vid, "title": title}
         _save_titles(data)
+
+
+def _fail_ok(vid: str, now: float) -> bool:
+    """Recuo progressivo: depois de falhas (ex.: members-only), tenta com
+    intervalo crescente (5min -> 30min no máximo)."""
+    f = _load_titles().get("fail", {}).get(vid)
+    if not f:
+        return True
+    cnt, last = f
+    return now - last >= min(cnt, 6) * CHECK_INTERVAL
+
+
+def mark_fail(vid: str) -> None:
+    with _state_lock:
+        data = _load_titles()
+        f = data.setdefault("fail", {})
+        cnt = f.get(vid, [0, 0])[0] + 1
+        f[vid] = [cnt, time.time()]
+        _save_titles(data)
+
+
+def clear_fail(vid: str) -> None:
+    with _state_lock:
+        data = _load_titles()
+        if vid in data.get("fail", {}):
+            del data["fail"][vid]
+            _save_titles(data)
+
+
+def was_posted(vid: str) -> bool:
+    return vid in _load_titles().get("posted", [])
+
+
+def mark_posted(vid: str) -> None:
+    """Registro permanente (últimos 300) do que já foi publicado nas redes —
+    vídeos que oscilam para fora e voltam ao ciclo não são repostados."""
+    with _state_lock:
+        data = _load_titles()
+        p = data.setdefault("posted", [])
+        if vid not in p:
+            p.append(vid)
+            data["posted"] = p[-300:]
+            _save_titles(data)
 
 
 _dur_cache = None
