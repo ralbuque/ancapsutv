@@ -1357,13 +1357,15 @@ def watcher() -> None:
                 # aviso imediato no ticker: o vídeo JÁ está no canal, mesmo
                 # que o processamento (legendas etc.) ainda vá demorar
                 for vid in new_top:
-                    if not was_posted(vid):
+                    # alerta uma única vez: título já salvo = já alertado
+                    if (not was_posted(vid)
+                            and vid not in _load_titles().get("titles", {})):
                         t = fetch_title(vid)
                         if t:
                             save_title(vid, t)
                             set_alert(t)
                             log(f"Vídeo novo no canal — aviso no ticker: {t[:60]}")
-                update_titles_order(ids)
+                update_titles_order(ids, keep_titles=new_top)
                 for vid in new_top:
                     enqueue_job("main", vid, prio=0)
                 for vid in backfill:
@@ -1556,12 +1558,13 @@ def backfill_titles(ids: list) -> None:
             log(f"Título recuperado para o ticker: {t[:60]}")
 
 
-def update_titles_order(ids_newest_first: list) -> None:
+def update_titles_order(ids_newest_first: list, keep_titles: list = None) -> None:
+    keep = set(ids_newest_first) | set(keep_titles or [])
     with _state_lock:
         data = _load_titles()
         data["order"] = ids_newest_first
         data["titles"] = {i: t for i, t in data["titles"].items()
-                          if i in ids_newest_first}
+                          if i in keep}
         _save_titles(data)
 
 
