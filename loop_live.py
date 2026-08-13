@@ -101,9 +101,10 @@ VERT_BG = _get("VERT_BG", "0xD35A25")     # cor das faixas (laranja do mock)
 VERT_TEXTCOL = _get("VERT_TEXTCOL", "0x1F1F1F")
 VERT_BITRATE = _get("VERT_BITRATE", "3500k")
 VERT_CHANNEL_TEXT = _get("VERT_CHANNEL_TEXT", "Canal ANCAPSU")
-VERT_CTA_LINES = _get("VERT_CTA_LINES",
-                      ["Veja o vídeo completo", "no YouTube", "",
-                       "Link no primeiro", "comentário"])
+# Sem CTA na imagem: o Instagram penaliza vídeos com "veja o resto em..."
+# (o link do YouTube vai só no primeiro comentário)
+VERT_CTA_LINES = _get("VERT_CTA_LINES", [])
+VERT_VIDEO_Y = _get("VERT_VIDEO_Y", 770)  # posição vertical do vídeo
 VERT_SUB_STYLE = _get("VERT_SUB_STYLE",
                       "FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,"
                       "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
@@ -599,7 +600,7 @@ def build_vertical(video_id: str, title: str):
 
     # título em arquivos por linha (mesma técnica do banner)
     tfiles = []
-    for i, ln in enumerate(textwrap.wrap(title or "", width=36)[:2]):
+    for i, ln in enumerate(textwrap.wrap(title or "", width=36)[:3]):
         lf = TMP_DIR / f"{video_id}.v{i}.txt"
         lf.write_text(ln, encoding="utf-8")
         tfiles.append(lf)
@@ -609,12 +610,12 @@ def build_vertical(video_id: str, title: str):
     fc = (f"color=c={VERT_BG}:s=1080x1920:r={FPS}[bg];"
           f"[0:v]crop=trunc(iw*{VERT_CROP}/2)*2:ih:0:0,"
           f"scale=1080:-2{subs},fps={FPS}[v0];"
-          f"[bg][v0]overlay=0:(H-h)/2+80:shortest=1[c0]")
+          f"[bg][v0]overlay=0:{VERT_VIDEO_Y}:shortest=1[c0]")
     cur = "c0"
     n = 1
     if thumb.exists():
-        fc = f"[1:v]scale=400:-2[tb];" + fc.replace("[c0]", "[cpre]")
-        fc += f";[cpre][tb]overlay=40:230[c0]"
+        fc = f"[1:v]scale=900:-2[tb];" + fc.replace("[c0]", "[cpre]")
+        fc += f";[cpre][tb]overlay=90:250[c0]"
         n = 2
     for i, lf in enumerate(tfiles):
         fc += (f";[{cur}]drawtext={font}textfile={lf.name}:fontsize=52:"
