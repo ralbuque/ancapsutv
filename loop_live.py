@@ -1755,6 +1755,10 @@ def ticker_thread() -> None:
                 last_t = t_text
             if al != last_a:
                 _write_text_file(ALERT_FILE, al)
+                if al and not last_a:
+                    log(f"Barra de alerta NO AR: {al.strip()[:70]}")
+                elif last_a and not al:
+                    log("Barra de alerta encerrada (voltou ao ticker).")
                 last_a = al
         except Exception as e:
             log(f"ERRO no ticker: {e}")
