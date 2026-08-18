@@ -77,7 +77,7 @@ PROMO_EVERY = 2        # 2 = alterna vinheta/promo; 3 = promo a cada 3 intervalo
 # Conecte as contas no painel da Ayrshare e cole a API Key aqui.
 AYRSHARE_ENABLED = False
 AYRSHARE_API_KEY = ""
-AYR_PLATFORMS = ["instagram", "tiktok"]
+AYR_PLATFORMS = ["instagram", "tiktok", "youtube"]  # youtube = Shorts no canal
 AYR_CAPTION_TEMPLATE = "{title}"
 AYR_COMMENT_TEMPLATE = "Veja o vídeo completo em {url}"
 AYR_MAX_SECONDS = 1190   # corte da versão vertical (Reels aceita até 20 min;

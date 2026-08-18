@@ -659,7 +659,8 @@ def build_vertical(video_id: str, title: str):
     return out
 
 
-def ayrshare_post(video_path: Path, caption: str, comment: str) -> None:
+def ayrshare_post(video_path: Path, caption: str, comment: str,
+                  title: str = "") -> None:
     """Envia o vídeo à Ayrshare e publica nas plataformas configuradas,
     com o primeiro comentário em seguida."""
     import requests
@@ -676,12 +677,17 @@ def ayrshare_post(video_path: Path, caption: str, comment: str) -> None:
         r2 = requests.put(j["uploadUrl"], data=f,
                           headers={"Content-Type": "video/mp4"}, timeout=3600)
     r2.raise_for_status()
+    body = {"post": caption[:2200],
+            "platforms": AYR_PLATFORMS,
+            "mediaUrls": [j["accessUrl"]],
+            "isVideo": True}
+    if "youtube" in [p.lower() for p in AYR_PLATFORMS]:
+        yt_title = (f"{title[:88]} #Shorts" if title else "#Shorts")
+        body["youTubeOptions"] = {"title": yt_title,
+                                  "visibility": "public",  # padrão é private!
+                                  "shorts": True}
     r3 = requests.post("https://api.ayrshare.com/api/post",
-                       json={"post": caption[:2200],
-                             "platforms": AYR_PLATFORMS,
-                             "mediaUrls": [j["accessUrl"]],
-                             "isVideo": True},
-                       headers=hdr, timeout=300)
+                       json=body, headers=hdr, timeout=300)
     r3.raise_for_status()
     resp = r3.json()
     pid = resp.get("id")
@@ -711,7 +717,8 @@ def post_to_socials(video_id: str, title: str) -> None:
             url = f"https://youtu.be/{video_id}"
             ayrshare_post(vert,
                           AYR_CAPTION_TEMPLATE.format(title=title, url=url),
-                          AYR_COMMENT_TEMPLATE.format(title=title, url=url))
+                          AYR_COMMENT_TEMPLATE.format(title=title, url=url),
+                          title=title)
     except Exception as e:
         log(f"ERRO ao publicar via Ayrshare ({video_id}): {e}")
     finally:
