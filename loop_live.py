@@ -304,8 +304,19 @@ def kill_stream() -> None:
             p.kill()
 
 
+LOG_FILE = BASE_DIR / "log.txt"
+
+
 def log(msg: str) -> None:
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    print(line, flush=True)
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 5_000_000:
+            LOG_FILE.replace(LOG_FILE.with_suffix(".old.txt"))  # rotação
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 # Prioridades (Windows): a transmissão roda ACIMA do normal e todo o
@@ -643,7 +654,10 @@ def build_vertical(video_id: str, title: str):
     if n == 2:
         cmd += ["-i", str(thumb)]
     cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
-            "-t", str(AYR_MAX_SECONDS),
+            # margem de 3s: com 180s cravados o contêiner arredonda para 3:01
+            # e o YouTube trata como vídeo comum, não Short (causou o loop de
+            # realimentação de reprocessar o próprio Short)
+            "-t", str(max(1, AYR_MAX_SECONDS - 3)),
             "-c:v", "libx264", "-preset", X264_PRESET,
             "-b:v", VERT_BITRATE, "-maxrate", VERT_BITRATE,
             "-bufsize", "7000k", "-g", str(FPS * 2),
@@ -677,31 +691,44 @@ def ayrshare_post(video_path: Path, caption: str, comment: str,
         r2 = requests.put(j["uploadUrl"], data=f,
                           headers={"Content-Type": "video/mp4"}, timeout=3600)
     r2.raise_for_status()
-    body = {"post": caption[:2200],
-            "platforms": AYR_PLATFORMS,
-            "mediaUrls": [j["accessUrl"]],
-            "isVideo": True}
-    if "youtube" in [p.lower() for p in AYR_PLATFORMS]:
-        yt_title = (f"{title[:88]} #Shorts" if title else "#Shorts")
-        body["youTubeOptions"] = {"title": yt_title,
-                                  "visibility": "public",  # padrão é private!
-                                  "shorts": True}
-    r3 = requests.post("https://api.ayrshare.com/api/post",
-                       json=body, headers=hdr, timeout=300)
-    r3.raise_for_status()
-    resp = r3.json()
-    pid = resp.get("id")
-    log(f"Ayrshare: publicado em {', '.join(AYR_PLATFORMS)} (id {pid}).")
-    if comment and pid:
-        for attempt in range(3):  # o post pode demorar a ficar ativo
+    def _comment(pid: str, plats: str) -> None:
+        for _attempt in range(3):  # o post pode demorar a ficar ativo
             rc = requests.post("https://api.ayrshare.com/api/comments",
                                json={"id": pid, "comment": comment[:500]},
                                headers=hdr, timeout=120)
             if rc.ok:
-                log("Ayrshare: primeiro comentário publicado.")
+                log(f"Ayrshare: primeiro comentário publicado ({plats}).")
                 return
             time.sleep(90)
-        log(f"AVISO: comentário Ayrshare falhou: {rc.text[:200]}")
+        log(f"AVISO: comentário Ayrshare falhou ({plats}): {rc.text[:200]}")
+
+    # YouTube vai em chamada SEPARADA: uma falha/re-tentativa dele nunca
+    # duplica os posts do Instagram/TikTok (aprendido na prática)
+    groups = []
+    others = [p for p in AYR_PLATFORMS if p.lower() != "youtube"]
+    if others:
+        groups.append(others)
+    if any(p.lower() == "youtube" for p in AYR_PLATFORMS):
+        groups.append(["youtube"])
+    for plats in groups:
+        body = {"post": caption[:2200], "platforms": plats,
+                "mediaUrls": [j["accessUrl"]], "isVideo": True}
+        if plats == ["youtube"]:
+            body["youTubeOptions"] = {
+                # NÃO anexar "#Shorts" aqui: a Ayrshare acrescenta sozinha
+                # (shorts=True); 80 chars garante nunca passar dos 100
+                "title": (title or caption)[:80],
+                "visibility": "public",  # padrão deles é private!
+                "shorts": True}
+        r3 = requests.post("https://api.ayrshare.com/api/post",
+                           json=body, headers=hdr, timeout=300)
+        if not r3.ok:
+            log(f"ERRO Ayrshare ({'/'.join(plats)}): {r3.text[:300]}")
+            continue
+        pid = r3.json().get("id")
+        log(f"Ayrshare: publicado em {', '.join(plats)} (id {pid}).")
+        if comment and pid:
+            _comment(pid, "/".join(plats))
 
 
 def post_to_socials(video_id: str, title: str) -> None:
@@ -712,6 +739,17 @@ def post_to_socials(video_id: str, title: str) -> None:
     try:
         if not AYRSHARE_ENABLED or not AYRSHARE_API_KEY:
             return
+        # trava de envio único: aconteça o que acontecer, cada vídeo só é
+        # enviado UMA vez à Ayrshare
+        with _state_lock:
+            data = _load_titles()
+            sent = data.setdefault("ayr_sent", [])
+            if video_id in sent:
+                log(f"Ayrshare: {video_id} já foi enviado — não reenviando.")
+                return
+            sent.append(video_id)
+            data["ayr_sent"] = sent[-300:]
+            _save_titles(data)
         vert = build_vertical(video_id, title)
         if vert:
             url = f"https://youtu.be/{video_id}"
@@ -970,6 +1008,21 @@ def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None,
     if r.returncode != 0 or not raw.exists():
         log(f"ERRO no download de {video_id}: {r.stderr.strip()[-400:]}")
         return False, None
+
+    # trava anti-realimentação: vídeo vertical (Short) nunca entra no ciclo
+    rp = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+              "-show_entries", "stream=width,height", "-of", "csv=p=0",
+              str(raw)])
+    try:
+        first = next((l for l in rp.stdout.splitlines() if l.strip()), "")
+        w, h = (int(x) for x in first.split(",")[:2])
+        if 0 < w < h:
+            log(f"{video_id} é vertical (Short) — descartado do ciclo.")
+            mark_skip(video_id)
+            safe_unlink(raw)
+            return False, None
+    except (ValueError, StopIteration):
+        pass
 
     # título lido do .info.json (sempre UTF-8 — o stdout do yt-dlp.exe sai na
     # codificação regional do Windows e corrompe acentos)
@@ -1347,7 +1400,7 @@ def watcher() -> None:
                     new_top.append(i)
                 new_top = [i for i in new_top[:MAX_VIDEOS + PRUNE_MARGIN]
                            if not (VIDEO_DIR / f"{i}.ts").exists()
-                           and _fail_ok(i, now)]
+                           and _fail_ok(i, now) and not is_skipped(i)]
                 # reposição: vídeos ANTIGOS só se faltar gente no ciclo —
                 # modo silencioso (sem alerta e sem repostar nas redes)
                 backfill = []
@@ -1356,24 +1409,34 @@ def watcher() -> None:
                     backfill = [i for i in ids_all
                                 if i not in new_top
                                 and not (VIDEO_DIR / f"{i}.ts").exists()
-                                and _fail_ok(i, now)][:need]
+                                and _fail_ok(i, now)
+                                and not is_skipped(i)][:need]
                 if not prev_known:
                     # primeira execução: nada é "novo", tudo é carga silenciosa
                     backfill = new_top + backfill
                     new_top = []
                 # aviso imediato no ticker: o vídeo JÁ está no canal, mesmo
                 # que o processamento (legendas etc.) ainda vá demorar
+                vetted = []
                 for vid in new_top:
                     # alerta uma única vez: título já salvo = já alertado
                     if (not was_posted(vid)
                             and vid not in _load_titles().get("titles", {})):
-                        t = fetch_title(vid)
+                        info = fetch_info(vid)
+                        if (info and 0 < info.get("width", 0)
+                                < info.get("height", 0)):
+                            # vertical = Short: nunca entra no ciclo
+                            mark_skip(vid)
+                            log(f"{vid} é vertical (Short) — fora do ciclo.")
+                            continue
+                        t = info.get("title", "") if info else ""
                         if t:
                             save_title(vid, t)
                             set_alert(t)
                             log(f"Vídeo novo no canal — aviso no ticker: {t[:60]}")
-                update_titles_order(ids, keep_titles=new_top)
-                for vid in new_top:
+                    vetted.append(vid)
+                update_titles_order(ids, keep_titles=vetted)
+                for vid in vetted:
                     enqueue_job("main", vid, prio=0)
                 for vid in backfill:
                     enqueue_job("main", vid, prio=1, cfg={"silent": True})
@@ -1473,6 +1536,22 @@ def clear_fail(vid: str) -> None:
             _save_titles(data)
 
 
+def is_skipped(vid: str) -> bool:
+    return vid in _load_titles().get("skip", [])
+
+
+def mark_skip(vid: str) -> None:
+    """Vídeos que NUNCA entram no ciclo (ex.: verticais/Shorts do próprio
+    canal — evita o loop de realimentação de repostar o próprio Short)."""
+    with _state_lock:
+        data = _load_titles()
+        s = data.setdefault("skip", [])
+        if vid not in s:
+            s.append(vid)
+            data["skip"] = s[-300:]
+            _save_titles(data)
+
+
 def was_posted(vid: str) -> bool:
     return vid in _load_titles().get("posted", [])
 
@@ -1533,8 +1612,8 @@ def get_duration_cached(p: Path) -> float:
     return d
 
 
-def fetch_title(vid: str) -> str:
-    """Busca só o título de um vídeo (sem baixar), sempre em UTF-8."""
+def fetch_info(vid: str) -> dict:
+    """Título e dimensões de um vídeo (sem baixar), sempre em UTF-8."""
     TMP_DIR.mkdir(exist_ok=True)
     out = TMP_DIR / f"t_{vid}.info.json"
     run(ytdlp_cmd() + ["--skip-download", "--write-info-json",
@@ -1542,12 +1621,19 @@ def fetch_title(vid: str) -> str:
                        f"https://www.youtube.com/watch?v={vid}"])
     if out.exists():
         try:
-            return json.loads(out.read_text(encoding="utf-8")).get("title", "")
+            j = json.loads(out.read_text(encoding="utf-8"))
+            return {"title": j.get("title", ""),
+                    "width": j.get("width") or 0,
+                    "height": j.get("height") or 0}
         except Exception:
-            return ""
+            return {}
         finally:
             safe_unlink(out)
-    return ""
+    return {}
+
+
+def fetch_title(vid: str) -> str:
+    return fetch_info(vid).get("title", "")
 
 
 def backfill_titles(ids: list) -> None:
