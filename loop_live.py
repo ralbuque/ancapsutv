@@ -1136,7 +1136,9 @@ def detect_classic() -> None:
     if not vid:
         return
     if not (gdir / f"{vid}.ts").exists():
-        if enqueue_job("guest", vid, cfg=dict(CLASSIC), prio=1):
+        # prioridade igual à dos vídeos novos: com prioridade menor ele era
+        # "furado" o dia todo pelas notícias que chegavam depois
+        if enqueue_job("guest", vid, cfg=dict(CLASSIC), prio=0):
             log(f"Classic {vid} na fila de processamento.")
     else:
         refs = _referenced_files()
@@ -1914,7 +1916,8 @@ def ticker_thread() -> None:
             if al != last_a:
                 _write_text_file(ALERT_FILE, al)
                 if al and not last_a:
-                    log(f"Barra de alerta NO AR: {al.strip()[:70]}")
+                    vis = al.replace("Áp", "", 1).strip()
+                    log(f"Barra de alerta NO AR: {vis[:70]}")
                 elif last_a and not al:
                     log("Barra de alerta encerrada (voltou ao ticker).")
                 last_a = al
