@@ -94,10 +94,11 @@ GUEST_CHANNELS = [
     #     "position": 10,               # posição no ciclo (1-based)
     #     "intro": "mundo_intro.mp4",   # vinheta apresentando o canal
     #     "outro": "mundo_outro.mp4",   # vinheta de volta à programação
-    #     "x_api_key": "",              # credenciais da conta X DESSE canal
-    #     "x_api_secret": "",
-    #     "x_access_token": "",
+    #     "x_api_key": "",              # credenciais da conta X desse canal
+    #     "x_api_secret": "",           # (ou as da conta principal, para
+    #     "x_access_token": "",         #  publicar os vídeos dele lá)
     #     "x_access_token_secret": "",
+    #     # "x_text_template": "Do canal Visão Libertária: {title}",
     #     # "cut_end": 10,  # segundos cortados do final (0 = não cortar)
     # },
     # {
@@ -110,6 +111,21 @@ GUEST_CHANNELS = [
     #     "x_access_token": "", "x_access_token_secret": "",
     # },
 ]
+
+# --- "Classic do dia": vídeo sorteado diariamente de um canal atemporal ---
+CLASSIC = {
+    # "name": "ANCAPSU Classic",
+    # "url": "https://www.youtube.com/@ancapsuclassic/videos",
+    # "position": 5,          # posição no ciclo
+    # "hour": 8,              # hora local (fuso do relógio da live) do sorteio
+    # "no_repeat_days": 7,    # não repete os sorteados nos últimos N dias
+    # "intro": "classic_intro.mp4",
+    # "outro": "classic_outro.mp4",
+    # "x_api_key": "", "x_api_secret": "",        # chaves da conta X principal
+    # "x_access_token": "", "x_access_token_secret": "",
+    # "x_text_template": "Clássico do dia: {title}",
+    # # "cut_end": 0,  # vídeos teóricos sem encerramento fixo? use 0
+}
 
 # --- Publicação automática no X (ex-Twitter) ---
 # Credenciais em developer.x.com (app com permissão Read and Write, OAuth 1.0a)

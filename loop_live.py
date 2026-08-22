@@ -25,6 +25,7 @@ import itertools
 import json
 import os
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -129,6 +130,15 @@ PROMO_EVERY = _get("PROMO_EVERY", 2)  # 2 = alterna vinheta/promo nos intervalos
 # posição fixa, com vinhetas próprias de entrada/saída e X em conta separada.
 # Lista de dicts — veja config.example.py para o formato.
 GUEST_CHANNELS = _get("GUEST_CHANNELS", [])
+
+# "Classic do dia": um vídeo SORTEADO diariamente de um canal de conteúdo
+# atemporal entra no ciclo (sem repetir nos últimos N dias). Formato igual ao
+# dos convidados + "hour" (hora local do sorteio) e "no_repeat_days".
+CLASSIC = _get("CLASSIC", {})
+
+
+def _guest_cfgs() -> list:
+    return list(GUEST_CHANNELS) + ([CLASSIC] if CLASSIC.get("url") else [])
 X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 
 # Banner de abertura (thumbnail + título no topo da tela)
@@ -550,7 +560,7 @@ def prepare_bumper() -> None:
                        "a chamada do outro canal")
         prepare_static(PROMO_OUTRO_SRC, PROMO_OUTRO_TS,
                        "a vinheta de continuidade")
-    for g in GUEST_CHANNELS:
+    for g in _guest_cfgs():
         slug = _slug(g.get("name", ""))
         if g.get("intro"):
             prepare_static(BASE_DIR / g["intro"],
@@ -869,9 +879,10 @@ def build_x_mp4(video_id: str, limit: float, src_dir: Path = None):
 
 
 def post_to_x(video_id: str, title: str, src_dir: Path = None,
-              creds: dict = None) -> None:
+              creds: dict = None, text_template: str = None) -> None:
     """Posta o vídeo processado no X. Falhas não interrompem o pipeline.
-    creds permite postar em outra conta (canais convidados)."""
+    creds permite postar em outra conta (canais convidados);
+    text_template substitui o X_TEXT_TEMPLATE global."""
     if creds is None:
         if not X_ENABLED:
             return
@@ -906,7 +917,7 @@ def post_to_x(video_id: str, title: str, src_dir: Path = None,
             consumer_key=creds["api_key"], consumer_secret=creds["api_secret"],
             access_token=creds["access_token"],
             access_token_secret=creds["access_token_secret"])
-        text = X_TEXT_TEMPLATE.format(
+        text = (text_template or X_TEXT_TEMPLATE).format(
             title=title, url=f"https://youtu.be/{video_id}")[:280]
 
         def send(path, category):
@@ -1083,6 +1094,58 @@ def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None,
     return ok, title
 
 
+def detect_classic() -> None:
+    """Uma vez por dia (após a hora configurada, no fuso do relógio da live),
+    sorteia um vídeo do canal Classic — sem repetir os dos últimos N dias —
+    e o coloca na fila; o restante segue o fluxo de canal convidado."""
+    if not CLASSIC.get("url"):
+        return
+    tz = timezone(timedelta(hours=CLOCK_UTC_OFFSET))
+    now_l = datetime.now(tz)
+    today = f"{now_l:%Y-%m-%d}"
+    slug = _slug(CLASSIC.get("name", "classic"))
+    gdir = GUESTS_DIR / slug
+    gdir.mkdir(parents=True, exist_ok=True)
+    data = _load_titles()
+    pick = data.get("classic_pick", {})
+    if now_l.hour >= CLASSIC.get("hour", 8) and pick.get("date") != today:
+        r = run(ytdlp_cmd() + ["--flat-playlist", "--print", "%(id)s",
+                               CLASSIC["url"]])
+        if r.returncode != 0:
+            log(f"ERRO ao listar o canal Classic: {r.stderr.strip()[-200:]}")
+            return
+        pool = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        cutoff = time.time() - CLASSIC.get("no_repeat_days", 7) * 86400
+        hist = [h for h in data.get("classic_hist", []) if h[1] >= cutoff]
+        recent = {h[0] for h in hist}
+        skip = set(data.get("skip", []))
+        cands = [i for i in pool if i not in recent and i not in skip]
+        if not cands:
+            log("Classic: nenhum candidato elegível no sorteio de hoje.")
+            return
+        vid = random.choice(cands)
+        with _state_lock:
+            d2 = _load_titles()
+            hist.append([vid, time.time()])
+            d2["classic_pick"] = {"id": vid, "date": today}
+            d2["classic_hist"] = hist[-400:]
+            _save_titles(d2)
+        log(f"Classic do dia sorteado ({len(cands)} candidatos): {vid}")
+        pick = {"id": vid, "date": today}
+    vid = pick.get("id")
+    if not vid:
+        return
+    if not (gdir / f"{vid}.ts").exists():
+        if enqueue_job("guest", vid, cfg=dict(CLASSIC), prio=1):
+            log(f"Classic {vid} na fila de processamento.")
+    else:
+        refs = _referenced_files()
+        for f in list(gdir.glob("*.ts")) + list(gdir.glob("*.jpg")):
+            if f.stem != vid and f.name not in refs:
+                log(f"Removendo classic anterior: {f.name}")
+                safe_unlink(f)
+
+
 def detect_shorts() -> None:
     """Detecção leve: enfileira shorts que faltam, busca títulos e limpa
     os que saíram do rodízio."""
@@ -1185,7 +1248,8 @@ def worker() -> None:
                                   creds={"api_key": ck[0],
                                          "api_secret": ck[1],
                                          "access_token": ck[2],
-                                         "access_token_secret": ck[3]})
+                                         "access_token_secret": ck[3]},
+                                  text_template=g.get("x_text_template"))
             elif kind == "short":
                 if process_short(vid):
                     sync_playlist(_last_ids)
@@ -1220,7 +1284,7 @@ def build_playlist(ids_newest_first: list):
         seq.append({"path": VIDEO_DIR / f"{i}.ts",
                     "label": f"{AGORA_PREFIX}{t}" if t else "",
                     "guest": None})
-    for g in sorted(GUEST_CHANNELS, key=lambda x: x.get("position", 999)):
+    for g in sorted(_guest_cfgs(), key=lambda x: x.get("position", 999)):
         slug = _slug(g.get("name", ""))
         st = gstate.get(slug)
         if not st:
@@ -1444,6 +1508,7 @@ def watcher() -> None:
                 prune_old(playable[:MAX_VIDEOS + PRUNE_MARGIN])
                 backfill_titles(ids)
                 detect_guests()
+                detect_classic()
                 detect_shorts()
                 sync_playlist(ids)  # cobre remoções e recupera atualizações perdidas
         except Exception as e:
