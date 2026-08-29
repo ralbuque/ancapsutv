@@ -70,6 +70,7 @@ CUT_END_SECONDS = _get("CUT_END_SECONDS", 10)
 BURN_SUBTITLES = _get("BURN_SUBTITLES", True)
 WHISPER_MODEL = _get("WHISPER_MODEL", "small")
 WHISPER_THREADS = _get("WHISPER_THREADS", 2)  # limita a CPU da transcrição
+SUB_MAX_CHARS = _get("SUB_MAX_CHARS", 84)  # máx. por legenda (~2 linhas de 42)
 SUBTITLE_STYLE = _get("SUBTITLE_STYLE",
                       "FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,"
                       "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
@@ -421,21 +422,54 @@ def generate_srt(video_path: Path, srt_path: Path) -> bool:
         kw["initial_prompt"] = ("Transcrição de noticiário em português do "
                                 f"Brasil. Vocabulário: {joined}.")
     segments, _info = model.transcribe(str(video_path), language="pt",
-                                       vad_filter=True, **kw)
+                                       vad_filter=True, word_timestamps=True,
+                                       **kw)
     fixes = load_fixes()
+    # remonta em blocos curtos usando o tempo de cada palavra — fala contínua
+    # gerava segmentos gigantes que cobriam a tela inteira
     entries = []
-    n = 0
+
+    def flush(words: list) -> None:
+        if not words:
+            return
+        text = apply_fixes("".join(w[2] for w in words).strip(), fixes)
+        if text:
+            entries.append((words[0][0], words[-1][1],
+                            "\n".join(textwrap.wrap(text, width=45))))
+
+    cur = []
     for seg in segments:
-        text = apply_fixes(seg.text.strip(), fixes)
-        if not text:
+        words = getattr(seg, "words", None) or []
+        if not words:
+            # sem timestamps de palavra (raro): divide proporcionalmente
+            flush(cur)
+            cur = []
+            text = apply_fixes(seg.text.strip(), fixes)
+            if not text:
+                continue
+            chunks = textwrap.wrap(text, width=SUB_MAX_CHARS)
+            dur = max(seg.end - seg.start, 0.5)
+            pos = seg.start
+            for c in chunks:
+                d = dur * len(c) / max(len(text), 1)
+                entries.append((pos, pos + d,
+                                "\n".join(textwrap.wrap(c, width=45))))
+                pos += d
             continue
-        n += 1
-        wrapped = "\n".join(textwrap.wrap(text, width=45))
-        entries.append(f"{n}\n{srt_time(seg.start)} --> {srt_time(seg.end)}\n"
-                       f"{wrapped}\n")
+        for w in words:
+            if cur and (sum(len(x[2]) for x in cur) + len(w.word) > SUB_MAX_CHARS
+                        or w.start - cur[0][0] > 7.0     # bloco de no máx. 7s
+                        or w.start - cur[-1][1] > 1.2):  # pausa = novo bloco
+                flush(cur)
+                cur = []
+            cur.append((w.start, w.end, w.word))
+    flush(cur)
     if not entries:
         return False
-    srt_path.write_text("\n".join(entries), encoding="utf-8")
+    srt_path.write_text(
+        "\n".join(f"{n}\n{srt_time(a)} --> {srt_time(b)}\n{t}\n"
+                  for n, (a, b, t) in enumerate(entries, 1)),
+        encoding="utf-8")
     return True
 
 
