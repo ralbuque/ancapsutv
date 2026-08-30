@@ -821,6 +821,10 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
             "fatos nem acrescente opiniões que não estejam na transcrição. "
             "Português do Brasil; parágrafos corridos, sem listas e sem "
             "subtítulos. Responda EXATAMENTE neste formato:\n"
+            "TITULO: <o título do vídeo com EXATAMENTE as mesmas palavras na "
+            "mesma ordem, apenas com a capitalização normalizada para caixa "
+            "de frase — maiúscula só na primeira letra, em nomes próprios e "
+            "em siglas>\n"
             "RESUMO: <resumo em primeira pessoa, no máximo 200 caracteres>\n"
             "ARTIGO:\n<parágrafos separados por linha em branco>")
         if SUBSTACK.get("voice"):
@@ -832,7 +836,14 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
         if not art["artigo"]:
             log(f"Substack: IA não gerou artigo para {video_id}.")
             return
-        titulo = title or art["titulo"]  # título LITERAL do vídeo
+        # título do vídeo com caixa normalizada pela IA — mas SÓ se as
+        # palavras forem idênticas (senão, vale o título original literal)
+        def _norm(s):
+            return re.sub(r"\W+", "", s.lower(), flags=re.UNICODE)
+        cand = (art["titulo"] or "").strip()
+        titulo = cand if (cand and title
+                          and _norm(cand) == _norm(title)) else (title
+                                                                 or cand)
         paras = [p for p in art["artigo"].split("\n\n") if p.strip()]
         paras.append(f"Assista ao vídeo completo: {url}")
         if substack_post(SUBSTACK, titulo, art["resumo"], paras,
@@ -849,6 +860,33 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
                 _save_titles(data)
     except Exception as e:
         log(f"ERRO no artigo de {video_id}: {e}")
+
+
+def _digest_image(today: str):
+    """Gera a arte do boletim com a data do dia carimbada."""
+    base_img = BASE_DIR / SUBSTACK.get("digest_image", "resumo_base.png")
+    if not base_img.exists():
+        return None
+    TMP_DIR.mkdir(exist_ok=True)
+    out = TMP_DIR / f"resumo_{today}.jpg"
+    font = (f"fontfile='{INTRO_FONT.replace(':', chr(92) + ':')}':"
+            if Path(INTRO_FONT).exists() else "")
+    x = SUBSTACK.get("digest_date_x", 990)
+    y = SUBSTACK.get("digest_date_y", 290)
+    size = SUBSTACK.get("digest_date_size", 72)
+    r = run(["ffmpeg", "-y", "-i", str(base_img),
+             "-vf", f"drawtext={font}text='{today}':fontsize={size}:"
+                    f"fontcolor=white:x={x}-text_w/2:y={y}",
+             "-frames:v", "1", "-q:v", "2", str(out)])
+    if r.returncode != 0 or not out.exists():
+        return None
+    return out
+
+
+def _file_data_uri(p: Path) -> str:
+    import base64
+    return ("data:image/jpeg;base64,"
+            + base64.b64encode(p.read_bytes()).decode())
 
 
 def detect_digest() -> None:
@@ -894,8 +932,12 @@ def run_digest(today: str) -> None:
     paras.append("Os vídeos de hoje:")
     for p in pend:
         paras.append(f"{p['title']} — {p['url']}")
+    img = _digest_image(today)
     if substack_post(SUBSTACK, titulo, f"O dia no canal, em resumo", paras,
-                     send_email=True):
+                     send_email=True,
+                     image_url=_file_data_uri(img) if img else None):
+        if img:
+            safe_unlink(img)
         with _state_lock:
             d2 = _load_titles()
             d2["digest_pending"] = []
