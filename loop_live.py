@@ -716,7 +716,8 @@ def _parse_sections(out: str) -> dict:
 
 
 def substack_post(cfg: dict, title: str, subtitle: str,
-                  paragraphs: list, send_email: bool) -> bool:
+                  paragraphs: list, send_email: bool,
+                  image_url: str = None) -> bool:
     """Publica um post no Substack (web-only quando send_email=False),
     autenticando pelo cookie de sessão do navegador (substack.sid)."""
     import requests
@@ -744,10 +745,23 @@ def substack_post(cfg: dict, title: str, subtitle: str,
                 user_id = (me[0] if me else users[0]).get("id")
         except Exception:
             pass
-        body = {"type": "doc",
-                "content": [{"type": "paragraph",
-                             "content": [{"type": "text", "text": p.strip()}]}
-                            for p in paragraphs if p.strip()]}
+        content = []
+        if image_url:
+            # sobe a imagem para o CDN do Substack e abre o artigo com ela
+            try:
+                ri = s.post(f"{base}/api/v1/image",
+                            json={"image": image_url}, timeout=120)
+                if ri.ok and ri.json().get("url"):
+                    content.append(
+                        {"type": "captionedImage",
+                         "content": [{"type": "image2",
+                                      "attrs": {"src": ri.json()["url"]}}]})
+            except Exception:
+                pass  # sem imagem não é motivo para não publicar
+        content += [{"type": "paragraph",
+                     "content": [{"type": "text", "text": p.strip()}]}
+                    for p in paragraphs if p.strip()]
+        body = {"type": "doc", "content": content}
         draft = {"draft_title": title[:250],
                  "draft_subtitle": (subtitle or "")[:250],
                  "draft_body": json.dumps(body),
@@ -787,14 +801,22 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
     try:
         url = f"https://youtu.be/{video_id}"
         system = (
-            "Você transforma transcrições de vídeos de um canal de notícias "
-            "em artigos escritos. Regras: português do Brasil; fiel aos "
-            "argumentos, opiniões e tom direto do autor; não invente fatos "
-            "nem acrescente opiniões suas; parágrafos corridos, sem listas e "
-            "sem subtítulos. Responda EXATAMENTE neste formato:\n"
+            "Você escreve a versão em texto dos vídeos do próprio autor do "
+            "canal, EM PRIMEIRA PESSOA — o artigo é o autor falando "
+            "diretamente ao leitor, como se ele mesmo tivesse escrito. NUNCA "
+            "se refira ao vídeo, ao 'autor' ou ao 'apresentador' em terceira "
+            "pessoa (nada de 'no vídeo ele argumenta'). Preserve os "
+            "argumentos, as opiniões, as ironias e o tom direto e coloquial "
+            "do original, apenas organizados como texto escrito. Não invente "
+            "fatos nem acrescente opiniões que não estejam na transcrição. "
+            "Português do Brasil; parágrafos corridos, sem listas e sem "
+            "subtítulos. Responda EXATAMENTE neste formato:\n"
             "TITULO: <título do artigo>\n"
-            "RESUMO: <resumo em 2 frases>\n"
+            "RESUMO: <resumo em 2 frases, também em primeira pessoa>\n"
             "ARTIGO:\n<parágrafos separados por linha em branco>")
+        if SUBSTACK.get("voice"):
+            system += ("\nInstruções adicionais de estilo do autor: "
+                       + SUBSTACK["voice"])
         out = ai_generate(system, f"Título do vídeo: {title}\n\n"
                                   f"Transcrição:\n{transcript[:24000]}")
         art = _parse_sections(out or "")
@@ -805,7 +827,9 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
         paras = [p for p in art["artigo"].split("\n\n") if p.strip()]
         paras.append(f"Assista ao vídeo completo: {url}")
         if substack_post(SUBSTACK, titulo, art["resumo"], paras,
-                         send_email=False):
+                         send_email=False,
+                         image_url=f"https://i.ytimg.com/vi/{video_id}/"
+                                   "maxresdefault.jpg"):
             log(f"Substack: artigo publicado (web-only): {titulo[:60]}")
             with _state_lock:
                 data = _load_titles()
@@ -841,11 +865,16 @@ def run_digest(today: str) -> None:
         return
     lista = "\n".join(f"- {p['title']}: {p['resumo']}" for p in pend)
     system = (
-        "Você escreve o boletim diário de um canal de notícias a partir dos "
-        "resumos dos vídeos do dia. Português do Brasil, tom direto do canal, "
-        "texto coeso em parágrafos, sem listas e sem subtítulos, costurando "
-        "os assuntos do dia. Não invente fatos. Responda EXATAMENTE assim:\n"
+        "Você escreve o boletim diário do canal EM PRIMEIRA PESSOA — é o "
+        "próprio autor recapitulando para o leitor os assuntos que cobriu "
+        "hoje ('hoje eu falei sobre...'), num texto coeso em parágrafos que "
+        "costura os temas do dia, no tom direto e coloquial dele. Nunca em "
+        "terceira pessoa, sem listas e sem subtítulos. Não invente fatos. "
+        "Português do Brasil. Responda EXATAMENTE assim:\n"
         "TITULO: <título do boletim>\nARTIGO:\n<parágrafos>")
+    if SUBSTACK.get("voice"):
+        system += ("\nInstruções adicionais de estilo do autor: "
+                   + SUBSTACK["voice"])
     out = ai_generate(system, f"Resumos dos vídeos de hoje:\n{lista}")
     art = _parse_sections(out or "")
     if not art["artigo"]:
