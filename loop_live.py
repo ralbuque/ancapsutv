@@ -722,9 +722,18 @@ def substack_post(cfg: dict, title: str, subtitle: str,
     import requests
     try:
         base = cfg["publication_url"].rstrip("/")
+        sid = cfg["sid"].strip()
+        if sid.startswith("s:"):  # colado decodificado? re-codifica
+            sid = "s%3A" + sid[2:]
         s = requests.Session()
-        s.cookies.set("substack.sid", cfg["sid"], domain=".substack.com")
+        s.headers["Cookie"] = f"substack.sid={sid}"
         s.headers["User-Agent"] = "Mozilla/5.0"
+        # sessão válida? distingue cookie ruim de falta de permissão
+        chk = s.get(f"{base}/api/v1/subscription", timeout=60)
+        if chk.status_code in (401, 403):
+            log("ERRO no Substack: cookie substack.sid inválido/expirado — "
+                "recolha-o de novo no navegador (valor começando com s%3A).")
+            return False
         # autor (byline): tenta casar pelo e-mail; senão, primeiro usuário
         user_id = None
         try:
