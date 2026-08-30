@@ -2354,6 +2354,17 @@ def main() -> None:
     log(f"Loop com os últimos {MAX_VIDEOS} vídeos | verificação a cada {CHECK_INTERVAL}s")
     log(f"Corte final: {CUT_END_SECONDS}s | Legendas: "
         f"{'ativadas (' + WHISPER_MODEL + ')' if BURN_SUBTITLES else 'desativadas'}")
+    sub = ("ON" if _substack_ok() else
+           "OFF (confira ANTHROPIC_API_KEY e SUBSTACK "
+           "email/password/publication_url)")
+    log("Integrações: "
+        f"X={'ON' if X_ENABLED else 'off'} | "
+        f"Ayrshare={'ON' if AYRSHARE_ENABLED and AYRSHARE_API_KEY else 'off'}"
+        f" ({', '.join(AYR_PLATFORMS)}) | "
+        f"Substack={sub} | "
+        f"convidados={len(GUEST_CHANNELS)} | "
+        f"classic={'ON' if CLASSIC.get('url') else 'off'} | "
+        f"promo={'ON' if PROMO_ENABLED else 'off'}")
     if LOWER_THIRD:
         # os arquivos precisam existir E ter ao menos 1 byte antes do primeiro
         # ffmpeg com drawtext (arquivo de 0 bytes falha no CreateFileMapping)
