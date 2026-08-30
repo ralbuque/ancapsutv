@@ -128,14 +128,15 @@ CLASSIC = {
 }
 
 # --- Artigos no Substack (por vídeo web-only + resumo diário com e-mail) ---
-# Requer: python -m pip install python-substack
-# e uma senha definida na conta Substack (Settings -> Set password).
+# Autenticação por COOKIE de sessão (login por senha cai em captcha no VPS):
+# no navegador logado no Substack -> F12 -> Application/Armazenamento ->
+# Cookies -> https://substack.com -> copie o VALOR de "substack.sid".
 ANTHROPIC_API_KEY = ""   # console.anthropic.com (gera os textos dos artigos)
 # ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 SUBSTACK = {
-    # "email": "voce@exemplo.com",
-    # "password": "senha-do-substack",
+    # "sid": "valor-do-cookie-substack.sid",
     # "publication_url": "https://ancapsu.substack.com",
+    # "email": "voce@exemplo.com",  # opcional (só para escolher o autor)
     # "digest_hour": 22,   # hora local (fuso do relógio) do resumo do dia
 }
 

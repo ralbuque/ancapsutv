@@ -150,8 +150,10 @@ SUBSTACK = _get("SUBSTACK", {})
 
 
 def _substack_ok() -> bool:
-    return bool(SUBSTACK.get("email") and SUBSTACK.get("password")
-                and SUBSTACK.get("publication_url") and ANTHROPIC_API_KEY)
+    # autenticação por cookie de sessão ("sid"): login por senha em IP de
+    # datacenter cai em captcha
+    return bool(SUBSTACK.get("sid") and SUBSTACK.get("publication_url")
+                and ANTHROPIC_API_KEY)
 X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 
 # Banner de abertura (thumbnail + título no topo da tela)
@@ -715,26 +717,51 @@ def _parse_sections(out: str) -> dict:
 
 def substack_post(cfg: dict, title: str, subtitle: str,
                   paragraphs: list, send_email: bool) -> bool:
-    """Publica um post no Substack (web-only quando send_email=False)."""
+    """Publica um post no Substack (web-only quando send_email=False),
+    autenticando pelo cookie de sessão do navegador (substack.sid)."""
+    import requests
     try:
-        from substack import Api
-        from substack.post import Post
-    except ImportError:
-        log("AVISO: instale o python-substack "
-            "(python -m pip install python-substack) — artigo pulado.")
-        return False
-    try:
-        api = Api(email=cfg["email"], password=cfg["password"],
-                  publication_url=cfg["publication_url"])
-        post = Post(title=title[:200], subtitle=(subtitle or "")[:200],
-                    user_id=api.get_user_id())
-        for p in paragraphs:
-            if p.strip():
-                post.add({"type": "paragraph", "content": p.strip()})
-        draft = api.post_draft(post.get_draft())
-        api.prepublish_draft(draft.get("id"))
-        api.publish_draft(draft.get("id"), send_email=send_email,
-                          share_automatically=False)
+        base = cfg["publication_url"].rstrip("/")
+        s = requests.Session()
+        s.cookies.set("substack.sid", cfg["sid"], domain=".substack.com")
+        s.headers["User-Agent"] = "Mozilla/5.0"
+        # autor (byline): tenta casar pelo e-mail; senão, primeiro usuário
+        user_id = None
+        try:
+            r = s.get(f"{base}/api/v1/publication/users", timeout=60)
+            if r.ok and isinstance(r.json(), list) and r.json():
+                users = r.json()
+                me = [u for u in users if u.get("email") == cfg.get("email")]
+                user_id = (me[0] if me else users[0]).get("id")
+        except Exception:
+            pass
+        body = {"type": "doc",
+                "content": [{"type": "paragraph",
+                             "content": [{"type": "text", "text": p.strip()}]}
+                            for p in paragraphs if p.strip()]}
+        draft = {"draft_title": title[:250],
+                 "draft_subtitle": (subtitle or "")[:250],
+                 "draft_body": json.dumps(body),
+                 "type": "newsletter",
+                 "audience": "everyone"}
+        if user_id:
+            draft["draft_bylines"] = [{"id": user_id, "is_guest": False}]
+        r = s.post(f"{base}/api/v1/drafts", json=draft, timeout=120)
+        if not r.ok:
+            log(f"ERRO no Substack (rascunho): {r.status_code} "
+                f"{r.text[:200]}")
+            return False
+        did = r.json().get("id")
+        try:
+            s.get(f"{base}/api/v1/drafts/{did}/prepublish", timeout=60)
+        except Exception:
+            pass
+        r = s.post(f"{base}/api/v1/drafts/{did}/publish",
+                   json={"send": bool(send_email)}, timeout=120)
+        if not r.ok:
+            log(f"ERRO no Substack (publicar): {r.status_code} "
+                f"{r.text[:200]} — rascunho {did} ficou salvo.")
+            return False
         return True
     except Exception as e:
         log(f"ERRO no Substack: {e}")
