@@ -127,6 +127,18 @@ CLASSIC = {
     # # "cut_end": 0,  # vídeos teóricos sem encerramento fixo? use 0
 }
 
+# --- Artigos no Substack (por vídeo web-only + resumo diário com e-mail) ---
+# Requer: python -m pip install python-substack
+# e uma senha definida na conta Substack (Settings -> Set password).
+ANTHROPIC_API_KEY = ""   # console.anthropic.com (gera os textos dos artigos)
+# ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+SUBSTACK = {
+    # "email": "voce@exemplo.com",
+    # "password": "senha-do-substack",
+    # "publication_url": "https://ancapsu.substack.com",
+    # "digest_hour": 22,   # hora local (fuso do relógio) do resumo do dia
+}
+
 # --- Publicação automática no X (ex-Twitter) ---
 # Credenciais em developer.x.com (app com permissão Read and Write, OAuth 1.0a)
 X_ENABLED = False

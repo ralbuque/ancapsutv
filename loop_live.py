@@ -140,6 +140,18 @@ CLASSIC = _get("CLASSIC", {})
 
 def _guest_cfgs() -> list:
     return list(GUEST_CHANNELS) + ([CLASSIC] if CLASSIC.get("url") else [])
+
+
+# Substack: artigo por vídeo (web-only) + resumo diário (com e-mail).
+# Estruturado por canal — no futuro, convidados podem ter o próprio dict.
+ANTHROPIC_API_KEY = _get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = _get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+SUBSTACK = _get("SUBSTACK", {})
+
+
+def _substack_ok() -> bool:
+    return bool(SUBSTACK.get("email") and SUBSTACK.get("password")
+                and SUBSTACK.get("publication_url") and ANTHROPIC_API_KEY)
 X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 
 # Banner de abertura (thumbnail + título no topo da tela)
@@ -640,6 +652,182 @@ def detect_guests() -> None:
                         safe_unlink(f)
         except Exception as e:
             log(f"ERRO no canal convidado {g.get('name', '?')}: {e}")
+
+
+# --------------------- ARTIGOS (SUBSTACK + IA) -------------------------
+
+def srt_to_text(path: Path) -> str:
+    """Extrai o texto corrido de um .srt."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    out = []
+    for l in lines:
+        s = l.strip()
+        if not s or s.isdigit() or "-->" in s:
+            continue
+        out.append(s)
+    return " ".join(out)
+
+
+def ai_generate(system: str, user_text: str, max_tokens: int = 3500):
+    """Chamada à API da Anthropic; retorna o texto ou None."""
+    import requests
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": ANTHROPIC_API_KEY,
+                 "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+        json={"model": ANTHROPIC_MODEL, "max_tokens": max_tokens,
+              "system": system,
+              "messages": [{"role": "user", "content": user_text}]},
+        timeout=300)
+    if not r.ok:
+        log(f"ERRO na API de texto: {r.text[:200]}")
+        return None
+    return "".join(b.get("text", "") for b in r.json().get("content", [])
+                   if b.get("type") == "text")
+
+
+def _parse_sections(out: str) -> dict:
+    """Separa TITULO / RESUMO / ARTIGO da resposta da IA."""
+    res = {"titulo": "", "resumo": "", "artigo": ""}
+    if not out:
+        return res
+    mode = None
+    body = []
+    for l in out.splitlines():
+        s = l.strip()
+        if s.upper().startswith("TITULO:"):
+            res["titulo"] = s.split(":", 1)[1].strip()
+            mode = None
+        elif s.upper().startswith("RESUMO:"):
+            res["resumo"] = s.split(":", 1)[1].strip()
+            mode = None
+        elif s.upper().startswith("ARTIGO:"):
+            mode = "artigo"
+        elif mode == "artigo":
+            body.append(l)
+    res["artigo"] = "\n".join(body).strip()
+    return res
+
+
+def substack_post(cfg: dict, title: str, subtitle: str,
+                  paragraphs: list, send_email: bool) -> bool:
+    """Publica um post no Substack (web-only quando send_email=False)."""
+    try:
+        from substack import Api
+        from substack.post import Post
+    except ImportError:
+        log("AVISO: instale o python-substack "
+            "(python -m pip install python-substack) — artigo pulado.")
+        return False
+    try:
+        api = Api(email=cfg["email"], password=cfg["password"],
+                  publication_url=cfg["publication_url"])
+        post = Post(title=title[:200], subtitle=(subtitle or "")[:200],
+                    user_id=api.get_user_id())
+        for p in paragraphs:
+            if p.strip():
+                post.add({"type": "paragraph", "content": p.strip()})
+        draft = api.post_draft(post.get_draft())
+        api.prepublish_draft(draft.get("id"))
+        api.publish_draft(draft.get("id"), send_email=send_email,
+                          share_automatically=False)
+        return True
+    except Exception as e:
+        log(f"ERRO no Substack: {e}")
+        return False
+
+
+def publish_video_article(video_id: str, title: str, transcript: str) -> None:
+    """Artigo do vídeo, publicado web-only (sem e-mail aos assinantes)."""
+    if not _substack_ok():
+        return
+    if not transcript or len(transcript) < 200:
+        log(f"Substack: transcrição de {video_id} insuficiente — sem artigo.")
+        return
+    try:
+        url = f"https://youtu.be/{video_id}"
+        system = (
+            "Você transforma transcrições de vídeos de um canal de notícias "
+            "em artigos escritos. Regras: português do Brasil; fiel aos "
+            "argumentos, opiniões e tom direto do autor; não invente fatos "
+            "nem acrescente opiniões suas; parágrafos corridos, sem listas e "
+            "sem subtítulos. Responda EXATAMENTE neste formato:\n"
+            "TITULO: <título do artigo>\n"
+            "RESUMO: <resumo em 2 frases>\n"
+            "ARTIGO:\n<parágrafos separados por linha em branco>")
+        out = ai_generate(system, f"Título do vídeo: {title}\n\n"
+                                  f"Transcrição:\n{transcript[:24000]}")
+        art = _parse_sections(out or "")
+        if not art["artigo"]:
+            log(f"Substack: IA não gerou artigo para {video_id}.")
+            return
+        titulo = art["titulo"] or title
+        paras = [p for p in art["artigo"].split("\n\n") if p.strip()]
+        paras.append(f"Assista ao vídeo completo: {url}")
+        if substack_post(SUBSTACK, titulo, art["resumo"], paras,
+                         send_email=False):
+            log(f"Substack: artigo publicado (web-only): {titulo[:60]}")
+            with _state_lock:
+                data = _load_titles()
+                pend = data.setdefault("digest_pending", [])
+                pend.append({"id": video_id, "title": titulo,
+                             "url": url, "resumo": art["resumo"]})
+                data["digest_pending"] = pend[-40:]
+                _save_titles(data)
+    except Exception as e:
+        log(f"ERRO no artigo de {video_id}: {e}")
+
+
+def detect_digest() -> None:
+    """Agenda o resumo do dia após a hora configurada (fuso do relógio)."""
+    if not _substack_ok():
+        return
+    tz = timezone(timedelta(hours=CLOCK_UTC_OFFSET))
+    now_l = datetime.now(tz)
+    today = f"{now_l:%Y-%m-%d}"
+    data = _load_titles()
+    if (now_l.hour >= SUBSTACK.get("digest_hour", 22)
+            and data.get("digest_date") != today
+            and data.get("digest_pending")):
+        if enqueue_job("digest", today, prio=1):
+            log("Resumo do dia agendado para publicação.")
+
+
+def run_digest(today: str) -> None:
+    """Boletim com os vídeos desde o último resumo — este VAI por e-mail."""
+    data = _load_titles()
+    pend = data.get("digest_pending", [])
+    if not pend:
+        return
+    lista = "\n".join(f"- {p['title']}: {p['resumo']}" for p in pend)
+    system = (
+        "Você escreve o boletim diário de um canal de notícias a partir dos "
+        "resumos dos vídeos do dia. Português do Brasil, tom direto do canal, "
+        "texto coeso em parágrafos, sem listas e sem subtítulos, costurando "
+        "os assuntos do dia. Não invente fatos. Responda EXATAMENTE assim:\n"
+        "TITULO: <título do boletim>\nARTIGO:\n<parágrafos>")
+    out = ai_generate(system, f"Resumos dos vídeos de hoje:\n{lista}")
+    art = _parse_sections(out or "")
+    if not art["artigo"]:
+        log("Substack: IA não gerou o resumo do dia — tento no próximo ciclo.")
+        return
+    titulo = art["titulo"] or SUBSTACK.get("digest_title", "Resumo do dia")
+    paras = [p for p in art["artigo"].split("\n\n") if p.strip()]
+    paras.append("Os vídeos de hoje:")
+    for p in pend:
+        paras.append(f"{p['title']} — {p['url']}")
+    if substack_post(SUBSTACK, titulo, f"O dia no canal, em resumo", paras,
+                     send_email=True):
+        with _state_lock:
+            d2 = _load_titles()
+            d2["digest_pending"] = []
+            d2["digest_date"] = today
+            _save_titles(d2)
+        log(f"Substack: resumo do dia publicado COM e-mail: {titulo[:60]}")
 
 
 # -------------------- INSTAGRAM/TIKTOK (AYRSHARE) ---------------------
@@ -1247,7 +1435,7 @@ def worker() -> None:
             kind, vid = job["kind"], job["id"]
             if kind == "main":
                 ok, title = download_and_normalize(
-                    vid, keep_temp=AYRSHARE_ENABLED)
+                    vid, keep_temp=AYRSHARE_ENABLED or _substack_ok())
                 if not ok:
                     mark_fail(vid)
                 else:
@@ -1264,8 +1452,12 @@ def worker() -> None:
                         safe_unlink(TMP_DIR / f"{vid}.srt")
                     else:
                         mark_posted(vid)
+                        transcript = srt_to_text(TMP_DIR / f"{vid}.srt")
                         post_to_x(vid, title or "")
                         post_to_socials(vid, title or "")
+                        publish_video_article(vid, title or "", transcript)
+                        safe_unlink(TMP_DIR / f"{vid}.mp4")
+                        safe_unlink(TMP_DIR / f"{vid}.srt")
             elif kind == "guest":
                 g = job["cfg"]
                 slug = _slug(g.get("name", ""))
@@ -1286,6 +1478,8 @@ def worker() -> None:
                                          "access_token": ck[2],
                                          "access_token_secret": ck[3]},
                                   text_template=g.get("x_text_template"))
+            elif kind == "digest":
+                run_digest(vid)  # vid = data do dia
             elif kind == "short":
                 if process_short(vid):
                     sync_playlist(_last_ids)
@@ -1545,6 +1739,7 @@ def watcher() -> None:
                 backfill_titles(ids)
                 detect_guests()
                 detect_classic()
+                detect_digest()
                 detect_shorts()
                 sync_playlist(ids)  # cobre remoções e recupera atualizações perdidas
         except Exception as e:
