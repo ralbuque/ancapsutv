@@ -715,6 +715,16 @@ def _parse_sections(out: str) -> dict:
     return res
 
 
+def _trim_words(text: str, n: int) -> str:
+    """Trunca sem cortar palavra no meio."""
+    if not text or len(text) <= n:
+        return text or ""
+    cut = text[:n - 1]
+    if " " in cut:
+        cut = cut[:cut.rfind(" ")]
+    return cut.rstrip(" ,;:.") + "…"
+
+
 def substack_post(cfg: dict, title: str, subtitle: str,
                   paragraphs: list, send_email: bool,
                   image_url: str = None) -> bool:
@@ -762,8 +772,8 @@ def substack_post(cfg: dict, title: str, subtitle: str,
                      "content": [{"type": "text", "text": p.strip()}]}
                     for p in paragraphs if p.strip()]
         body = {"type": "doc", "content": content}
-        draft = {"draft_title": title[:250],
-                 "draft_subtitle": (subtitle or "")[:250],
+        draft = {"draft_title": _trim_words(title, 250),
+                 "draft_subtitle": _trim_words(subtitle or "", 280),
                  "draft_body": json.dumps(body),
                  "type": "newsletter",
                  "audience": "everyone"}
@@ -811,8 +821,7 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
             "fatos nem acrescente opiniões que não estejam na transcrição. "
             "Português do Brasil; parágrafos corridos, sem listas e sem "
             "subtítulos. Responda EXATAMENTE neste formato:\n"
-            "TITULO: <título do artigo>\n"
-            "RESUMO: <resumo em 2 frases, também em primeira pessoa>\n"
+            "RESUMO: <resumo em primeira pessoa, no máximo 200 caracteres>\n"
             "ARTIGO:\n<parágrafos separados por linha em branco>")
         if SUBSTACK.get("voice"):
             system += ("\nInstruções adicionais de estilo do autor: "
@@ -823,7 +832,7 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
         if not art["artigo"]:
             log(f"Substack: IA não gerou artigo para {video_id}.")
             return
-        titulo = art["titulo"] or title
+        titulo = title or art["titulo"]  # título LITERAL do vídeo
         paras = [p for p in art["artigo"].split("\n\n") if p.strip()]
         paras.append(f"Assista ao vídeo completo: {url}")
         if substack_post(SUBSTACK, titulo, art["resumo"], paras,
