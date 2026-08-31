@@ -138,6 +138,14 @@ SUBSTACK = {
     # "publication_url": "https://ancapsu.substack.com",
     # "email": "voce@exemplo.com",  # opcional (só para escolher o autor)
     # "digest_hour": 22,   # hora local (fuso do relógio) do resumo do dia
+    # "voice": "",         # instruções extras de estilo para a IA (opcional)
+    # --- arte do resumo do dia (data carimbada sobre resumo_base.png) ---
+    # "digest_image": "resumo_base.png",  # imagem base (1280x720)
+    # "digest_date_x": 990,   # centro horizontal do texto da data, em pixels
+    #                         # (maior = mais à direita)
+    # "digest_date_y": 290,   # topo do texto da data, em pixels a partir do
+    #                         # alto da imagem (maior = mais para baixo)
+    # "digest_date_size": 72, # tamanho da fonte da data
 }
 
 # --- Publicação automática no X (ex-Twitter) ---
