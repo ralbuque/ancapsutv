@@ -100,6 +100,14 @@ GUEST_CHANNELS = [
     #     "x_access_token_secret": "",
     #     # "x_text_template": "Do canal Visão Libertária: {title}",
     #     # "cut_end": 10,  # segundos cortados do final (0 = não cortar)
+    #     # Substack PRÓPRIO do canal (artigo por vídeo, COM e-mail;
+    #     # sem resumo diário). Mesmo formato do SUBSTACK principal:
+    #     # "substack": {
+    #     #     "sid": "cookie-substack.sid-da-conta-desse-canal",
+    #     #     "publication_url": "https://mundoemrevolucao.substack.com",
+    #     #     "voice": "",            # estilo do autor desse canal
+    #     #     # "send_email": True,   # padrão True nos convidados
+    #     # },
     # },
     # {
     #     "name": "Safesrc",

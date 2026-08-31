@@ -149,11 +149,15 @@ ANTHROPIC_MODEL = _get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 SUBSTACK = _get("SUBSTACK", {})
 
 
-def _substack_ok() -> bool:
+def _sub_cfg_ok(cfg: dict) -> bool:
     # autenticação por cookie de sessão ("sid"): login por senha em IP de
     # datacenter cai em captcha
-    return bool(SUBSTACK.get("sid") and SUBSTACK.get("publication_url")
+    return bool(cfg and cfg.get("sid") and cfg.get("publication_url")
                 and ANTHROPIC_API_KEY)
+
+
+def _substack_ok() -> bool:
+    return _sub_cfg_ok(SUBSTACK)
 X_TARGET_SIZE_MB = _get("X_TARGET_SIZE_MB", 500)  # teto da API é ~512 MB
 
 # Banner de abertura (thumbnail + título no topo da tela)
@@ -546,7 +550,7 @@ def normalize(src: Path, dst: Path, t_limit=None, srt: Path = None,
     cmd += _encode_args() + [f"./{tmp_out.name}"]
     r = run(cmd, cwd=str(workdir))
     if r.returncode != 0 or not tmp_out.exists():
-        log(f"ERRO na normalização de {src.name}: {r.stderr.strip()[-400:]}")
+        log(f"ERRO na normalização de {src.name}: {r.stderr.strip()[-1500:]}")
         tmp_out.unlink(missing_ok=True)
         return False
     shutil.move(str(tmp_out), str(dst))
@@ -569,7 +573,7 @@ def normalize_short(src: Path, dst: Path) -> bool:
     r = run(cmd, cwd=str(workdir))
     if r.returncode != 0 or not tmp_out.exists():
         log(f"ERRO na normalização do short {src.name}: "
-            f"{r.stderr.strip()[-300:]}")
+            f"{r.stderr.strip()[-1500:]}")
         tmp_out.unlink(missing_ok=True)
         return False
     shutil.move(str(tmp_out), str(dst))
@@ -856,9 +860,13 @@ def substack_post(cfg: dict, title: str, subtitle: str,
         return False
 
 
-def publish_video_article(video_id: str, title: str, transcript: str) -> None:
-    """Artigo do vídeo, publicado web-only (sem e-mail aos assinantes)."""
-    if not _substack_ok():
+def publish_video_article(video_id: str, title: str, transcript: str,
+                          cfg: dict = None,
+                          register_digest: bool = True) -> None:
+    """Artigo do vídeo, publicado web-only por padrão. cfg permite o
+    Substack próprio de um canal convidado (sem resumo diário)."""
+    sub = cfg or SUBSTACK
+    if not _sub_cfg_ok(sub):
         return
     if not transcript or len(transcript) < 200:
         log(f"Substack: transcrição de {video_id} insuficiente — sem artigo.")
@@ -882,9 +890,9 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
             "em siglas>\n"
             "RESUMO: <resumo em primeira pessoa, no máximo 200 caracteres>\n"
             "ARTIGO:\n<parágrafos separados por linha em branco>")
-        if SUBSTACK.get("voice"):
+        if sub.get("voice"):
             system += ("\nInstruções adicionais de estilo do autor: "
-                       + SUBSTACK["voice"])
+                       + sub["voice"])
         out = ai_generate(system, f"Título do vídeo: {title}\n\n"
                                   f"Transcrição:\n{transcript[:24000]}")
         art = _parse_sections(out or "")
@@ -909,12 +917,18 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
             if refs:
                 paras.append("Referências:")
                 paras += refs
-        posted = substack_post(SUBSTACK, titulo, art["resumo"], paras,
-                               send_email=False,
+        # canal principal: web-only (o e-mail do dia é o resumo);
+        # convidados: com e-mail (1 vídeo/dia = newsletter diária)
+        send = bool(sub.get("send_email", cfg is not None))
+        posted = substack_post(sub, titulo, art["resumo"], paras,
+                               send_email=send,
                                image_url=f"https://i.ytimg.com/vi/{video_id}/"
                                          "maxresdefault.jpg")
         if posted:
-            log(f"Substack: artigo publicado (web-only): {titulo[:60]}")
+            log(f"Substack: artigo publicado "
+                f"({'com e-mail' if send else 'web-only'}): {titulo[:60]}")
+            if not register_digest:
+                return
             with _state_lock:
                 data = _load_titles()
                 pend = data.setdefault("digest_pending", [])
@@ -1667,8 +1681,11 @@ def worker() -> None:
                 g = job["cfg"]
                 slug = _slug(g.get("name", ""))
                 gdir = GUESTS_DIR / slug
+                g_sub = g.get("substack") or {}
+                keep = _sub_cfg_ok(g_sub)
                 ok, title = download_and_normalize(
-                    vid, out_dir=gdir, cut_end=g.get("cut_end"))
+                    vid, out_dir=gdir, cut_end=g.get("cut_end"),
+                    keep_temp=keep)
                 if ok:
                     save_guest_state(slug, vid, title or "")
                     sync_playlist(_last_ids)
@@ -1683,6 +1700,14 @@ def worker() -> None:
                                          "access_token": ck[2],
                                          "access_token_secret": ck[3]},
                                   text_template=g.get("x_text_template"))
+                    if keep:
+                        transcript = srt_to_text(TMP_DIR / f"{vid}.srt")
+                        publish_video_article(vid, title or "", transcript,
+                                              cfg=g_sub,
+                                              register_digest=False)
+                safe_unlink(TMP_DIR / f"{vid}.mp4")
+                safe_unlink(TMP_DIR / f"{vid}.srt")
+                safe_unlink(TMP_DIR / f"{vid}.refs.txt")
             elif kind == "digest":
                 run_digest(vid)  # vid = data do dia
             elif kind == "short":
