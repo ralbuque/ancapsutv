@@ -658,6 +658,28 @@ def detect_guests() -> None:
 
 # --------------------- ARTIGOS (SUBSTACK + IA) -------------------------
 
+def _parse_refs(description: str) -> list:
+    """Extrai os links da seção 'Referências:' da descrição do vídeo."""
+    if not description:
+        return []
+    lines = description.splitlines()
+    start = next((i for i, l in enumerate(lines)
+                  if re.match(r"\s*refer[êe]ncias?\s*:?\s*$",
+                              l, re.IGNORECASE)), None)
+    if start is None:
+        return []
+    refs = []
+    for l in lines[start + 1:]:
+        found = re.findall(r"https?://\S+", l)
+        if found:
+            refs += found
+        elif refs:
+            break  # fim do bloco contíguo de referências
+        elif l.strip():
+            break  # linha de outra seção antes de qualquer link
+    return [u.rstrip(".,;)") for u in refs]
+
+
 def srt_to_text(path: Path) -> str:
     """Extrai o texto corrido de um .srt."""
     try:
@@ -768,8 +790,37 @@ def substack_post(cfg: dict, title: str, subtitle: str,
                                       "attrs": {"src": ri.json()["url"]}}]})
             except Exception:
                 pass  # sem imagem não é motivo para não publicar
-        content += [{"type": "paragraph",
-                     "content": [{"type": "text", "text": p.strip()}]}
+        def _pm_urls(text):
+            """URLs soltas viram links clicáveis."""
+            parts, pos = [], 0
+            for m in re.finditer(r"https?://\S+", text):
+                if m.start() > pos:
+                    parts.append({"type": "text",
+                                  "text": text[pos:m.start()]})
+                u = m.group(0).rstrip(".,;)")
+                parts.append({"type": "text", "text": u,
+                              "marks": [{"type": "link",
+                                         "attrs": {"href": u}}]})
+                pos = m.start() + len(u)
+            if pos < len(text):
+                parts.append({"type": "text", "text": text[pos:]})
+            return parts
+
+        def _pm_text(text):
+            """Links estilo [texto](url) + URLs soltas."""
+            parts, pos = [], 0
+            for m in re.finditer(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", text):
+                if m.start() > pos:
+                    parts += _pm_urls(text[pos:m.start()])
+                parts.append({"type": "text", "text": m.group(1),
+                              "marks": [{"type": "link",
+                                         "attrs": {"href": m.group(2)}}]})
+                pos = m.end()
+            if pos < len(text):
+                parts += _pm_urls(text[pos:])
+            return parts or [{"type": "text", "text": text}]
+
+        content += [{"type": "paragraph", "content": _pm_text(p.strip())}
                     for p in paragraphs if p.strip()]
         body = {"type": "doc", "content": content}
         draft = {"draft_title": _trim_words(title, 250),
@@ -795,7 +846,11 @@ def substack_post(cfg: dict, title: str, subtitle: str,
             log(f"ERRO no Substack (publicar): {r.status_code} "
                 f"{r.text[:200]} — rascunho {did} ficou salvo.")
             return False
-        return True
+        try:
+            slug = r.json().get("slug")
+        except Exception:
+            slug = None
+        return f"{base}/p/{slug}" if slug else True
     except Exception as e:
         log(f"ERRO no Substack: {e}")
         return False
@@ -846,16 +901,27 @@ def publish_video_article(video_id: str, title: str, transcript: str) -> None:
                                                                  or cand)
         paras = [p for p in art["artigo"].split("\n\n") if p.strip()]
         paras.append(f"Assista ao vídeo completo: {url}")
-        if substack_post(SUBSTACK, titulo, art["resumo"], paras,
-                         send_email=False,
-                         image_url=f"https://i.ytimg.com/vi/{video_id}/"
-                                   "maxresdefault.jpg"):
+        refs_file = TMP_DIR / f"{video_id}.refs.txt"
+        if refs_file.exists():
+            refs = [l.strip() for l in
+                    refs_file.read_text(encoding="utf-8").splitlines()
+                    if l.strip()]
+            if refs:
+                paras.append("Referências:")
+                paras += refs
+        posted = substack_post(SUBSTACK, titulo, art["resumo"], paras,
+                               send_email=False,
+                               image_url=f"https://i.ytimg.com/vi/{video_id}/"
+                                         "maxresdefault.jpg")
+        if posted:
             log(f"Substack: artigo publicado (web-only): {titulo[:60]}")
             with _state_lock:
                 data = _load_titles()
                 pend = data.setdefault("digest_pending", [])
                 pend.append({"id": video_id, "title": titulo,
-                             "url": url, "resumo": art["resumo"]})
+                             "url": url, "resumo": art["resumo"],
+                             "sub_url": posted if isinstance(posted, str)
+                                        else ""})
                 data["digest_pending"] = pend[-40:]
                 _save_titles(data)
     except Exception as e:
@@ -910,15 +976,19 @@ def run_digest(today: str) -> None:
     pend = data.get("digest_pending", [])
     if not pend:
         return
-    lista = "\n".join(f"- {p['title']}: {p['resumo']}" for p in pend)
+    lista = "\n".join(f"{i + 1}. {p['title']}: {p['resumo']}"
+                      for i, p in enumerate(pend))
     system = (
         "Você escreve o boletim diário do canal EM PRIMEIRA PESSOA — é o "
         "próprio autor recapitulando para o leitor os assuntos que cobriu "
         "hoje ('hoje eu falei sobre...'), num texto coeso em parágrafos que "
         "costura os temas do dia, no tom direto e coloquial dele. Nunca em "
         "terceira pessoa, sem listas e sem subtítulos. Não invente fatos. "
-        "Português do Brasil. Responda EXATAMENTE assim:\n"
-        "TITULO: <título do boletim>\nARTIGO:\n<parágrafos>")
+        "IMPORTANTE: ao tratar do assunto do vídeo N, envolva UMA frase "
+        "curta e relevante daquele trecho com a marcação {{N|frase}} — "
+        "exatamente esse formato, uma única vez por vídeo (vira o link para "
+        "o artigo completo). Português do Brasil. Responda EXATAMENTE "
+        "assim:\nTITULO: <título do boletim>\nARTIGO:\n<parágrafos>")
     if SUBSTACK.get("voice"):
         system += ("\nInstruções adicionais de estilo do autor: "
                    + SUBSTACK["voice"])
@@ -928,10 +998,22 @@ def run_digest(today: str) -> None:
         log("Substack: IA não gerou o resumo do dia — tento no próximo ciclo.")
         return
     titulo = art["titulo"] or SUBSTACK.get("digest_title", "Resumo do dia")
-    paras = [p for p in art["artigo"].split("\n\n") if p.strip()]
+    # {{N|frase}} -> [frase](url do artigo N); sem URL do artigo, fica só o texto
+    url_map = {str(i + 1): p.get("sub_url", "") for i, p in enumerate(pend)}
+
+    def _rep(m):
+        u = url_map.get(m.group(1), "")
+        return f"[{m.group(2)}]({u})" if u else m.group(2)
+
+    artigo = re.sub(r"\{\{(\d+)\|([^}]+)\}\}", _rep, art["artigo"])
+    paras = [p for p in artigo.split("\n\n") if p.strip()]
     paras.append("Os vídeos de hoje:")
     for p in pend:
-        paras.append(f"{p['title']} — {p['url']}")
+        if p.get("sub_url"):
+            paras.append(f"[{p['title']}]({p['sub_url']}) — "
+                         f"[assista ao vídeo]({p['url']})")
+        else:
+            paras.append(f"{p['title']} — {p['url']}")
     img = _digest_image(today)
     if substack_post(SUBSTACK, titulo, f"O dia no canal, em resumo", paras,
                      send_email=True,
@@ -1373,15 +1455,20 @@ def download_and_normalize(video_id: str, out_dir: Path = None, cut_end=None,
     except (ValueError, StopIteration):
         pass
 
-    # título lido do .info.json (sempre UTF-8 — o stdout do yt-dlp.exe sai na
-    # codificação regional do Windows e corrompe acentos)
+    # título e referências lidos do .info.json (sempre UTF-8 — o stdout do
+    # yt-dlp.exe sai na codificação regional do Windows e corrompe acentos)
     title = ""
     info = TMP_DIR / f"{video_id}.info.json"
     if info.exists():
         try:
-            title = json.loads(info.read_text(encoding="utf-8")).get("title", "")
+            j = json.loads(info.read_text(encoding="utf-8"))
+            title = j.get("title", "")
+            refs = _parse_refs(j.get("description", ""))
+            if refs:
+                (TMP_DIR / f"{video_id}.refs.txt").write_text(
+                    "\n".join(refs), encoding="utf-8")
         except Exception as e:
-            log(f"AVISO: falha ao ler o título de {video_id}: {e}")
+            log(f"AVISO: falha ao ler os metadados de {video_id}: {e}")
         info.unlink(missing_ok=True)
 
     # banner de abertura: thumbnail (baixada acima) + título, um arquivo
@@ -1566,6 +1653,7 @@ def worker() -> None:
                             "sem alerta e sem repostar nas redes.")
                         safe_unlink(TMP_DIR / f"{vid}.mp4")
                         safe_unlink(TMP_DIR / f"{vid}.srt")
+                        safe_unlink(TMP_DIR / f"{vid}.refs.txt")
                     else:
                         mark_posted(vid)
                         transcript = srt_to_text(TMP_DIR / f"{vid}.srt")
@@ -1574,6 +1662,7 @@ def worker() -> None:
                         publish_video_article(vid, title or "", transcript)
                         safe_unlink(TMP_DIR / f"{vid}.mp4")
                         safe_unlink(TMP_DIR / f"{vid}.srt")
+                        safe_unlink(TMP_DIR / f"{vid}.refs.txt")
             elif kind == "guest":
                 g = job["cfg"]
                 slug = _slug(g.get("name", ""))
