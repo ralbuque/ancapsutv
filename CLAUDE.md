@@ -43,6 +43,13 @@ Automação completa de distribuição de conteúdo do canal ANCAPSU (notícias,
   progressivo de falhas (5→30 min) em `titles.json["fail"]`.
 - **ticker**: escreve `ticker/alert/agora/data/hora.txt` (drawtext reload=1
   relê a cada frame). Escrita SEM rename e SEM truncar a zero (ver Lições).
+- **short_repost** (thread independente, `SHORT_REPOST` no config): a cada
+  600 s lista os 5 shorts mais recentes do Palácio Assombrado; short novo →
+  baixa como está (sem legenda/corte) → X (`x_post_file`, texto = título,
+  sem reply) + Ayrshare (instagram/facebook-reels/tiktok, legenda = título,
+  `Profile-Key` opcional p/ contas de outro canal). Estado em
+  `titles.json["short_repost"]` {seen, posted}; na 1ª execução só registra
+  os atuais. Trava `posted` antes de postar (envio único).
 - **progress reader**: lê `-progress` do FFmpeg → posição de exibição →
   AGORA (com `AGORA_DELAY` p/ latência do YouTube) e retomada.
 

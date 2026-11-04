@@ -73,6 +73,28 @@ PROMO_OUTRO_NAME = "continuidade.mp4"   # "Continue agora com a TV ANCAPSU"
 PROMO_MAX_SHORTS = 10  # rodízio com os N shorts mais recentes
 PROMO_EVERY = 2        # 2 = alterna vinheta/promo; 3 = promo a cada 3 intervalos
 
+# --- Replicação de shorts novos do outro canal (Palácio Assombrado) ---
+# Independente da live/promo: cada short novo do canal é baixado como está
+# (sem legenda, sem corte) e publicado no X e, via Ayrshare, no Instagram/
+# Facebook/TikTok, com o título do short como texto do post.
+SHORT_REPOST = {
+    "enabled": False,
+    # "channel_url": "https://www.youtube.com/@SEU_OUTRO_CANAL/shorts",  # padrão: PROMO_CHANNEL_URL
+    "check_every": 600,          # segundos entre verificações
+    "window": 5,                 # quantos shorts recentes olhar
+    "post_existing": False,      # True = replica também os já existentes na 1ª execução
+    "text_template": "{title}",  # texto do post ({title}, {url}) — sem link = mais barato no X
+    # X: credenciais da conta do outro canal; vazias = conta principal (X_ENABLED)
+    "x": True,
+    "x_api_key": "", "x_api_secret": "",
+    "x_access_token": "", "x_access_token_secret": "",
+    # Ayrshare (usa AYRSHARE_API_KEY): plataformas e, se as contas do outro
+    # canal estiverem em outro perfil da Ayrshare, o Profile-Key dele
+    "platforms": ["instagram", "facebook", "tiktok"],
+    "ayrshare_profile_key": "",
+    "facebook_reels": True,      # Facebook como Reels (vídeo vertical)
+}
+
 # --- Instagram/TikTok via Ayrshare (versão vertical automática) ---
 # Conecte as contas no painel da Ayrshare e cole a API Key aqui.
 AYRSHARE_ENABLED = False

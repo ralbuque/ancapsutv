@@ -126,6 +126,8 @@ PROMO_INTRO_NAME = _get("PROMO_INTRO_NAME", "chamada.mp4")
 PROMO_OUTRO_NAME = _get("PROMO_OUTRO_NAME", "continuidade.mp4")
 PROMO_MAX_SHORTS = _get("PROMO_MAX_SHORTS", 10)  # tamanho do rodízio de shorts
 PROMO_EVERY = _get("PROMO_EVERY", 2)  # 2 = alterna vinheta/promo nos intervalos
+# Replicação de shorts novos de um canal (Palácio Assombrado) p/ X e Ayrshare
+SHORT_REPOST = _get("SHORT_REPOST", {}) or {}
 
 # Canais convidados: o vídeo mais recente de cada um entra no ciclo numa
 # posição fixa, com vinhetas próprias de entrada/saída e X em conta separada.
@@ -1118,11 +1120,18 @@ def build_vertical(video_id: str, title: str):
 
 
 def ayrshare_post(video_path: Path, caption: str, comment: str,
-                  title: str = "") -> None:
+                  title: str = "", platforms: list = None,
+                  profile_key: str = "", fb_reels: bool = False) -> None:
     """Envia o vídeo à Ayrshare e publica nas plataformas configuradas,
-    com o primeiro comentário em seguida."""
+    com o primeiro comentário em seguida.
+    platforms: lista de plataformas (padrão AYR_PLATFORMS);
+    profile_key: Profile-Key de outro perfil da Ayrshare (contas de outro
+    canal) — vazio usa o perfil principal; fb_reels: Facebook como Reels."""
     import requests
     hdr = {"Authorization": f"Bearer {AYRSHARE_API_KEY}"}
+    if profile_key:
+        hdr["Profile-Key"] = profile_key
+    platforms = platforms or AYR_PLATFORMS
     r = requests.get("https://api.ayrshare.com/api/media/uploadUrl",
                      params={"contentType": "video/mp4",
                              "fileName": video_path.name},
@@ -1149,14 +1158,17 @@ def ayrshare_post(video_path: Path, caption: str, comment: str,
     # YouTube vai em chamada SEPARADA: uma falha/re-tentativa dele nunca
     # duplica os posts do Instagram/TikTok (aprendido na prática)
     groups = []
-    others = [p for p in AYR_PLATFORMS if p.lower() != "youtube"]
+    others = [p for p in platforms if p.lower() != "youtube"]
     if others:
         groups.append(others)
-    if any(p.lower() == "youtube" for p in AYR_PLATFORMS):
+    if any(p.lower() == "youtube" for p in platforms):
         groups.append(["youtube"])
     for plats in groups:
         body = {"post": caption[:2200], "platforms": plats,
                 "mediaUrls": [j["accessUrl"]], "isVideo": True}
+        if fb_reels and any(p.lower() == "facebook" for p in plats):
+            body["faceBookOptions"] = {"reels": True,
+                                       "title": (title or caption)[:255]}
         if plats == ["youtube"]:
             body["youTubeOptions"] = {
                 # NÃO anexar "#Shorts" aqui: a Ayrshare acrescenta sozinha
@@ -1208,6 +1220,173 @@ def post_to_socials(video_id: str, title: str) -> None:
         safe_unlink(srt)
         if vert:
             safe_unlink(vert)
+
+
+# ------------------- REPLICAÇÃO DE SHORTS (outro canal) ----------------
+
+def _sr(key, default=None):
+    return SHORT_REPOST.get(key, default)
+
+
+def short_repost_ok() -> bool:
+    if not _sr("enabled"):
+        return False
+    return bool(_sr("channel_url") or PROMO_CHANNEL_URL)
+
+
+def _sr_x_creds():
+    """Conta X do canal replicado; vazio = conta principal (se X_ENABLED)."""
+    ck = [_sr("x_api_key"), _sr("x_api_secret"), _sr("x_access_token"),
+          _sr("x_access_token_secret")]
+    if all(ck):
+        return {"api_key": ck[0], "api_secret": ck[1],
+                "access_token": ck[2], "access_token_secret": ck[3]}
+    if X_ENABLED and X_API_KEY:
+        return {"api_key": X_API_KEY, "api_secret": X_API_SECRET,
+                "access_token": X_ACCESS_TOKEN,
+                "access_token_secret": X_ACCESS_TOKEN_SECRET}
+    return None
+
+
+def x_post_file(mp4: Path, text: str, creds: dict, label: str) -> bool:
+    """Posta um arquivo de vídeo no X como está (sem corte/endcard/reply)."""
+    try:
+        import tweepy
+    except ImportError:
+        log("AVISO: tweepy não instalado — post no X pulado.")
+        return False
+    auth = tweepy.OAuth1UserHandler(creds["api_key"], creds["api_secret"],
+                                    creds["access_token"],
+                                    creds["access_token_secret"])
+    api = tweepy.API(auth)
+    client = tweepy.Client(consumer_key=creds["api_key"],
+                           consumer_secret=creds["api_secret"],
+                           access_token=creds["access_token"],
+                           access_token_secret=creds["access_token_secret"])
+    dur = video_duration(mp4) or 0
+    category = "amplify_video" if dur > 140 else "tweet_video"
+    for i in range(3):
+        try:
+            log(f"X: enviando {label} ({category}, {dur:.0f}s)...")
+            media = api.media_upload(str(mp4), chunked=True,
+                                     media_category=category)
+            client.create_tweet(text=text[:280], media_ids=[media.media_id])
+            log(f"X: postado {label}.")
+            return True
+        except Exception as e:
+            transient = any(t in str(e) for t in (
+                "Failed to send request", "Connection", "SSL", "timed out",
+                "Timeout", "Temporarily"))
+            if transient and i < 2:
+                log(f"X: falha de rede ({str(e)[:100]}) — tentando de novo em 60s")
+                time.sleep(60)
+            else:
+                log(f"ERRO ao postar {label} no X: {e}")
+                return False
+    return False
+
+
+def _sr_state() -> dict:
+    return _load_titles().get("short_repost", {"seen": [], "posted": []})
+
+
+def _sr_save(state: dict) -> None:
+    with _state_lock:
+        data = _load_titles()
+        state["seen"] = state["seen"][-200:]
+        state["posted"] = state["posted"][-200:]
+        data["short_repost"] = state
+        _save_titles(data)
+
+
+def repost_short(sid: str) -> None:
+    """Baixa o short como está e replica: X (texto = título) e Ayrshare
+    (legenda = título). Sem legenda queimada, sem corte, sem link."""
+    TMP_DIR.mkdir(exist_ok=True)
+    stem = TMP_DIR / f"sr_{sid}"
+    mp4 = stem.with_suffix(".mp4")
+    info_path = stem.with_suffix(".info.json")
+    try:
+        r = run(ytdlp_cmd() + [
+            "-f", "bv*[ext=mp4][height<=1920]+ba[ext=m4a]/b[ext=mp4]/b",
+            "--merge-output-format", "mp4", "--write-info-json",
+            "-o", str(mp4), f"https://www.youtube.com/watch?v={sid}"])
+        if r.returncode != 0 or not mp4.exists():
+            log(f"ERRO no download do short {sid} p/ replicação: "
+                f"{(r.stdout or '').strip()[-200:]}")
+            return
+        title = ""
+        if info_path.exists():   # título SEMPRE do .info.json (UTF-8)
+            try:
+                title = json.loads(info_path.read_text(encoding="utf-8")
+                                   ).get("title", "") or ""
+            except Exception:
+                title = ""
+        title = title or _load_titles().get("shorts", {}).get(sid, "") or sid
+        text = (_sr("text_template") or "{title}").format(
+            title=title, url=f"https://youtube.com/shorts/{sid}")
+        label = f"short {sid} «{title[:50]}»"
+        creds = _sr_x_creds()
+        if _sr("x", True) and creds:
+            x_post_file(mp4, text, creds, label)
+        plats = _sr("platforms") or ["instagram", "facebook", "tiktok"]
+        if plats and AYRSHARE_API_KEY:
+            try:
+                ayrshare_post(mp4, text, "", title=title, platforms=plats,
+                              profile_key=_sr("ayrshare_profile_key", ""),
+                              fb_reels=_sr("facebook_reels", True))
+            except Exception as e:
+                log(f"ERRO Ayrshare ao replicar {label}: {e}")
+        elif plats:
+            log("Replicação: AYRSHARE_API_KEY vazio — Instagram/Facebook/"
+                "TikTok pulados.")
+    finally:
+        safe_unlink(mp4)
+        safe_unlink(info_path)
+        for f in TMP_DIR.glob(f"sr_{sid}.*"):
+            safe_unlink(f)
+
+
+def short_repost_watcher() -> None:
+    """Thread independente: a cada N s olha os shorts mais recentes do canal
+    e replica os que ainda não viu. Na 1ª execução só registra os atuais
+    (não dispara o acervo inteiro)."""
+    url = _sr("channel_url") or PROMO_CHANNEL_URL
+    every = int(_sr("check_every", 600))
+    window = int(_sr("window", 5))
+    first = True
+    while True:
+        try:
+            r = run(ytdlp_cmd() + ["--flat-playlist", "--playlist-end",
+                                   str(window), "--print", "%(id)s", url])
+            ids = [l.strip() for l in (r.stdout or "").splitlines()
+                   if l.strip()]
+            if r.returncode != 0 or not ids:
+                log("Replicação: falha ao listar shorts: "
+                    f"{(r.stdout or '').strip()[-150:]}")
+            else:
+                st = _sr_state()
+                known = set(st["seen"]) | set(st["posted"])
+                new = [i for i in ids if i not in known]
+                if first and not st["seen"] and not st["posted"] \
+                        and not _sr("post_existing", False):
+                    st["seen"] = ids
+                    _sr_save(st)
+                    log(f"Replicação: {len(ids)} shorts atuais registrados; "
+                        "só os próximos serão replicados.")
+                    new = []
+                for sid in reversed(new):   # do mais antigo p/ o mais novo
+                    st = _sr_state()
+                    if sid in st["posted"]:
+                        continue
+                    st["posted"].append(sid)   # trava ANTES de postar
+                    _sr_save(st)
+                    log(f"Replicação: short novo {sid}.")
+                    repost_short(sid)
+        except Exception as e:
+            log(f"ERRO na replicação de shorts: {e}")
+        first = False
+        time.sleep(every)
 
 
 # ------------------------- POST NO X ----------------------------------
@@ -2594,7 +2773,8 @@ def main() -> None:
         f"Substack={sub} | "
         f"convidados={len(GUEST_CHANNELS)} | "
         f"classic={'ON' if CLASSIC.get('url') else 'off'} | "
-        f"promo={'ON' if PROMO_ENABLED else 'off'}")
+        f"promo={'ON' if PROMO_ENABLED else 'off'} | "
+        f"replica-shorts={'ON' if short_repost_ok() else 'off'}")
     if LOWER_THIRD:
         # os arquivos precisam existir E ter ao menos 1 byte antes do primeiro
         # ffmpeg com drawtext (arquivo de 0 bytes falha no CreateFileMapping)
@@ -2606,6 +2786,9 @@ def main() -> None:
                          name="ticker").start()
     threading.Thread(target=worker, daemon=True, name="worker").start()
     threading.Thread(target=watcher, daemon=True, name="watcher").start()
+    if short_repost_ok():
+        threading.Thread(target=short_repost_watcher, daemon=True,
+                         name="short_repost").start()
     try:
         streamer()
     except KeyboardInterrupt:
