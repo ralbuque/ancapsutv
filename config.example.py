@@ -95,7 +95,7 @@ SHORT_REPOST = {
     "platforms": ["instagram", "facebook", "tiktok"],
     "ayrshare_api_key": "",
     "ayrshare_profile_key": "",
-    "facebook_reels": True,      # Facebook como Reels (vídeo vertical)
+    "facebook_reels": True,      # Facebook como Reels até 90 s; acima vai como vídeo comum
 }
 
 # --- Instagram/TikTok via Ayrshare (versão vertical automática) ---

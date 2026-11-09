@@ -1170,8 +1170,13 @@ def ayrshare_post(video_path: Path, caption: str, comment: str,
         body = {"post": caption[:2200], "platforms": plats,
                 "mediaUrls": [j["accessUrl"]], "isVideo": True}
         if fb_reels and any(p.lower() == "facebook" for p in plats):
-            body["faceBookOptions"] = {"reels": True,
-                                       "title": (title or caption)[:255]}
+            dur = video_duration(video_path) or 0
+            if dur <= 90:          # limite de duração dos Reels do Facebook
+                body["faceBookOptions"] = {"reels": True,
+                                           "title": (title or caption)[:255]}
+            else:
+                log(f"Ayrshare: {dur:.0f}s > 90s — Facebook como vídeo "
+                    "comum (não Reels).")
         if plats == ["youtube"]:
             body["youTubeOptions"] = {
                 # NÃO anexar "#Shorts" aqui: a Ayrshare acrescenta sozinha
@@ -1181,11 +1186,21 @@ def ayrshare_post(video_path: Path, caption: str, comment: str,
                 "shorts": True}
         r3 = requests.post("https://api.ayrshare.com/api/post",
                            json=body, headers=hdr, timeout=300)
-        if not r3.ok:
-            log(f"ERRO Ayrshare ({'/'.join(plats)}): {r3.text[:300]}")
+        try:
+            j3 = r3.json()
+        except ValueError:
+            j3 = {}
+        ok_plats = [x.get("platform") for x in (j3.get("postIds") or [])
+                    if x.get("status") == "success"]
+        for err in (j3.get("errors") or []):
+            log(f"ERRO Ayrshare ({err.get('platform', '?')}): "
+                f"{str(err.get('message', err))[:250]}")
+        if not r3.ok and not ok_plats:
+            if not j3.get("errors"):
+                log(f"ERRO Ayrshare ({'/'.join(plats)}): {r3.text[:300]}")
             continue
-        pid = r3.json().get("id")
-        log(f"Ayrshare: publicado em {', '.join(plats)} (id {pid}).")
+        pid = j3.get("id")
+        log(f"Ayrshare: publicado em {', '.join(ok_plats or plats)} (id {pid}).")
         if comment and pid:
             _comment(pid, "/".join(plats))
 
@@ -1327,7 +1342,7 @@ def repost_short(sid: str) -> int:
         # recodifica sempre: garante H.264 yuv420p + AAC, timestamps limpos
         # (o merge do yt-dlp avisa DTS não-monotônico) e faststart
         r = run(["ffmpeg", "-y", "-i", str(raw),
-                 "-c:v", "libx264", "-preset", X264_PRESET, "-crf", "20",
+                 "-c:v", "libx264", "-preset", X264_PRESET, "-crf", "23",
                  "-pix_fmt", "yuv420p", "-r", "30",
                  "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
                  "-movflags", "+faststart", str(mp4)])
