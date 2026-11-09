@@ -1136,7 +1136,8 @@ def ayrshare_post(video_path: Path, caption: str, comment: str,
                      params={"contentType": "video/mp4",
                              "fileName": video_path.name},
                      headers=hdr, timeout=60)
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"uploadUrl {r.status_code}: {r.text[:300]}")
     j = r.json()
     log(f"Ayrshare: enviando {video_path.name} "
         f"({video_path.stat().st_size / 1e6:.0f} MB)...")
@@ -1299,22 +1300,39 @@ def _sr_save(state: dict) -> None:
         _save_titles(data)
 
 
-def repost_short(sid: str) -> None:
-    """Baixa o short como está e replica: X (texto = título) e Ayrshare
-    (legenda = título). Sem legenda queimada, sem corte, sem link."""
+def repost_short(sid: str) -> int:
+    """Baixa o short e replica: X (texto = título) e Ayrshare (legenda =
+    título). Sem legenda queimada, sem corte, sem link. Retorna quantas
+    publicações deram certo (0 = nada publicado → pode tentar de novo)."""
     TMP_DIR.mkdir(exist_ok=True)
     stem = TMP_DIR / f"sr_{sid}"
+    raw = TMP_DIR / f"sr_{sid}_raw.mp4"
     mp4 = stem.with_suffix(".mp4")
-    info_path = stem.with_suffix(".info.json")
+    info_path = TMP_DIR / f"sr_{sid}_raw.info.json"
+    ok_count = 0
     try:
+        # prefere H.264 (avc1); o YouTube costuma servir AV1/VP9 em .mp4,
+        # que a API do X recusa ("media IDs are invalid")
         r = run(ytdlp_cmd() + [
-            "-f", "bv*[ext=mp4][height<=1920]+ba[ext=m4a]/b[ext=mp4]/b",
+            "-f", "bv*[vcodec^=avc1][height<=1920]+ba[ext=m4a]/"
+                  "bv*[ext=mp4][height<=1920]+ba[ext=m4a]/b[ext=mp4]/b",
             "--merge-output-format", "mp4", "--write-info-json",
-            "-o", str(mp4), f"https://www.youtube.com/watch?v={sid}"])
-        if r.returncode != 0 or not mp4.exists():
+            "-o", str(raw), f"https://www.youtube.com/watch?v={sid}"])
+        if r.returncode != 0 or not raw.exists():
             log(f"ERRO no download do short {sid} p/ replicação: "
                 f"{(r.stdout or '').strip()[-200:]}")
-            return
+            return 0
+        # recodifica sempre: garante H.264 yuv420p + AAC, timestamps limpos
+        # (o merge do yt-dlp avisa DTS não-monotônico) e faststart
+        r = run(["ffmpeg", "-y", "-i", str(raw),
+                 "-c:v", "libx264", "-preset", X264_PRESET, "-crf", "20",
+                 "-pix_fmt", "yuv420p", "-r", "30",
+                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                 "-movflags", "+faststart", str(mp4)])
+        if r.returncode != 0 or not mp4.exists():
+            log(f"ERRO ao recodificar o short {sid}: "
+                f"{(r.stdout or '').strip()[-300:]}")
+            return 0
         title = ""
         if info_path.exists():   # título SEMPRE do .info.json (UTF-8)
             try:
@@ -1328,22 +1346,23 @@ def repost_short(sid: str) -> None:
         label = f"short {sid} «{title[:50]}»"
         creds = _sr_x_creds()
         if _sr("x", True) and creds:
-            x_post_file(mp4, text, creds, label)
+            if x_post_file(mp4, text, creds, label):
+                ok_count += 1
         plats = _sr("platforms") or ["instagram", "facebook", "tiktok"]
         if plats and AYRSHARE_API_KEY:
             try:
                 ayrshare_post(mp4, text, "", title=title, platforms=plats,
                               profile_key=_sr("ayrshare_profile_key", ""),
                               fb_reels=_sr("facebook_reels", True))
+                ok_count += 1
             except Exception as e:
                 log(f"ERRO Ayrshare ao replicar {label}: {e}")
         elif plats:
             log("Replicação: AYRSHARE_API_KEY vazio — Instagram/Facebook/"
                 "TikTok pulados.")
+        return ok_count
     finally:
-        safe_unlink(mp4)
-        safe_unlink(info_path)
-        for f in TMP_DIR.glob(f"sr_{sid}.*"):
+        for f in TMP_DIR.glob(f"sr_{sid}*"):
             safe_unlink(f)
 
 
@@ -1382,7 +1401,21 @@ def short_repost_watcher() -> None:
                     st["posted"].append(sid)   # trava ANTES de postar
                     _sr_save(st)
                     log(f"Replicação: short novo {sid}.")
-                    repost_short(sid)
+                    if repost_short(sid) == 0:
+                        # nada saiu em lugar nenhum: sem risco de duplicar,
+                        # então volta para a fila (máx. 3 tentativas)
+                        st = _sr_state()
+                        fails = st.setdefault("fails", {})
+                        fails[sid] = fails.get(sid, 0) + 1
+                        if fails[sid] < 3 and sid in st["posted"]:
+                            st["posted"].remove(sid)
+                            log(f"Replicação: {sid} não foi publicado — "
+                                f"nova tentativa no próximo ciclo "
+                                f"({fails[sid]}/3).")
+                        else:
+                            log(f"Replicação: {sid} desistindo após "
+                                f"{fails[sid]} tentativas.")
+                        _sr_save(st)
         except Exception as e:
             log(f"ERRO na replicação de shorts: {e}")
         first = False
@@ -2798,4 +2831,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "repost":
+        # teste manual da replicação: python loop_live.py repost <id_do_short>
+        n = repost_short(sys.argv[2])
+        print(f"{n} publicação(ões) ok")
+        sys.exit(0 if n else 1)
     main()
