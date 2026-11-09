@@ -47,7 +47,9 @@ Automação completa de distribuição de conteúdo do canal ANCAPSU (notícias,
   600 s lista os 5 shorts mais recentes do Palácio Assombrado; short novo →
   baixa como está (sem legenda/corte) → X (`x_post_file`, texto = título,
   sem reply) + Ayrshare (instagram/facebook-reels/tiktok, legenda = título,
-  `Profile-Key` opcional p/ contas de outro canal). Estado em
+  `ayrshare_api_key` = API key da conta Ayrshare separada do Palácio;
+  `Profile-Key` só para perfis dentro da MESMA conta — API key de outra
+  conta como Profile-Key dá 403). Estado em
   `titles.json["short_repost"]` {seen, posted}; na 1ª execução só registra
   os atuais. Trava `posted` antes de postar (envio único).
 - **progress reader**: lê `-progress` do FFmpeg → posição de exibição →

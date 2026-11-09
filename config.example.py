@@ -88,9 +88,12 @@ SHORT_REPOST = {
     "x": True,
     "x_api_key": "", "x_api_secret": "",
     "x_access_token": "", "x_access_token_secret": "",
-    # Ayrshare (usa AYRSHARE_API_KEY): plataformas e, se as contas do outro
-    # canal estiverem em outro perfil da Ayrshare, o Profile-Key dele
+    # Ayrshare: plataformas e a conta. Contas do outro canal em uma OUTRA
+    # conta Ayrshare → "ayrshare_api_key" (API key dela). Se forem um perfil
+    # dentro da mesma conta (plano Business) → "ayrshare_profile_key".
+    # Ambos vazios = conta/perfil principal (AYRSHARE_API_KEY).
     "platforms": ["instagram", "facebook", "tiktok"],
+    "ayrshare_api_key": "",
     "ayrshare_profile_key": "",
     "facebook_reels": True,      # Facebook como Reels (vídeo vertical)
 }

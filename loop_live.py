@@ -1121,14 +1121,16 @@ def build_vertical(video_id: str, title: str):
 
 def ayrshare_post(video_path: Path, caption: str, comment: str,
                   title: str = "", platforms: list = None,
-                  profile_key: str = "", fb_reels: bool = False) -> None:
+                  profile_key: str = "", fb_reels: bool = False,
+                  api_key: str = "") -> None:
     """Envia o vídeo à Ayrshare e publica nas plataformas configuradas,
     com o primeiro comentário em seguida.
     platforms: lista de plataformas (padrão AYR_PLATFORMS);
     profile_key: Profile-Key de outro perfil da Ayrshare (contas de outro
-    canal) — vazio usa o perfil principal; fb_reels: Facebook como Reels."""
+    canal) — vazio usa o perfil principal; fb_reels: Facebook como Reels;
+    api_key: API key de OUTRA conta Ayrshare (vazio = AYRSHARE_API_KEY)."""
     import requests
-    hdr = {"Authorization": f"Bearer {AYRSHARE_API_KEY}"}
+    hdr = {"Authorization": f"Bearer {api_key or AYRSHARE_API_KEY}"}
     if profile_key:
         hdr["Profile-Key"] = profile_key
     platforms = platforms or AYR_PLATFORMS
@@ -1349,17 +1351,19 @@ def repost_short(sid: str) -> int:
             if x_post_file(mp4, text, creds, label):
                 ok_count += 1
         plats = _sr("platforms") or ["instagram", "facebook", "tiktok"]
-        if plats and AYRSHARE_API_KEY:
+        ayr_key = _sr("ayrshare_api_key", "") or AYRSHARE_API_KEY
+        if plats and ayr_key:
             try:
                 ayrshare_post(mp4, text, "", title=title, platforms=plats,
                               profile_key=_sr("ayrshare_profile_key", ""),
-                              fb_reels=_sr("facebook_reels", True))
+                              fb_reels=_sr("facebook_reels", True),
+                              api_key=ayr_key)
                 ok_count += 1
             except Exception as e:
                 log(f"ERRO Ayrshare ao replicar {label}: {e}")
         elif plats:
-            log("Replicação: AYRSHARE_API_KEY vazio — Instagram/Facebook/"
-                "TikTok pulados.")
+            log("Replicação: sem API key da Ayrshare (ayrshare_api_key / "
+                "AYRSHARE_API_KEY) — Instagram/Facebook/TikTok pulados.")
         return ok_count
     finally:
         for f in TMP_DIR.glob(f"sr_{sid}*"):
